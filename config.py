@@ -7,6 +7,7 @@ INSTITUTION = "University of Oxford"
 # CONTEXT KEYWORDS
 # If a news article mentions a name but NOT one of these words, it is likely noise.
 # We include "LCDS", "Oxford", and general topic keywords.
+# config.py
 CONTEXT_KEYWORDS = [
     "Oxford",
     "Leverhulme",

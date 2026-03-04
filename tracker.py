@@ -6,121 +6,135 @@ import os
 import time
 from datetime import datetime, date
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- CONFIGURATION ---
 INPUT_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 START_DATE_FILTER = "2023-01-01"
 
-CONTEXT_KEYWORDS = ["Oxford", "Leverhulme", "LCDS", "Demographic", "Population", "Sociology", "Nuffield", "Social Science", "Study", "Research"]
-OXFORD_RSS_URLS = ["https://www.ox.ac.uk/feeds/rss/news", "https://www.oxfordmail.co.uk/news/rss/"]
+# SEARCH TERMS FOR "GENERAL" CENTRE MENTIONS (Replaces the noisy RSS feeds)
+CENTRE_QUERIES = [
+    '"Leverhulme Centre for Demographic Science"',
+    '"LCDS Oxford"',
+]
 
+# --- HELPERS ---
 def clean_html(text):
     if not text: return ""
     return BeautifulSoup(text, "html.parser").get_text()
 
-def is_relevant(text, keywords):
-    if not text: return False
-    text_lower = text.lower()
-    return any(k.lower() in text_lower for k in keywords)
+# --- WORKER FUNCTIONS (API CALLS) ---
+def fetch_google_news(query):
+    """
+    Fetches news for a specific query using Google RSS.
+    We append 'Oxford' or 'LCDS' to the query URL to force relevance 
+    on the server side, ensuring we don't miss key academics.
+    """
+    # ENHANCEMENT: Construct a smart query to filter noise AT THE SOURCE.
+    # If query is a person's name, ensure it looks for Oxford/LCDS context.
+    if "Leverhulme" not in query: 
+        # e.g., search for: "Melinda Mills" AND ("Oxford" OR "Demographic")
+        # This catches "Melinda Mills" in an Oxford context even if the snippet is short.
+        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Sociology")'
+    else:
+        smart_query = query
 
-# --- ROBUST ENGINES ---
-def fetch_news_rss(query, engine="google", strict_filter=False):
+    encoded = urllib.parse.quote(smart_query)
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
+    
     try:
-        # Safe encoding for names with accents/special characters
-        encoded = urllib.parse.quote(str(query))
-        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en" if engine == "google" else f"https://www.bing.com/news/search?q={encoded}&format=rss"
-        
-        # Explicit timeout and User-Agent
-        resp = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        # Timeout is crucial for threading
+        resp = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0 (LCDS Bot)'})
         feed = feedparser.parse(resp.content)
         
         results = []
         for entry in feed.entries:
             title = entry.title
             summary = clean_html(getattr(entry, 'summary', ''))
+            
+            # Date Parsing
             try:
                 dt = pd.to_datetime(entry.published).date()
             except:
                 dt = date.today()
-            if strict_filter and not is_relevant(f"{title} {summary}", CONTEXT_KEYWORDS):
-                continue
+
             results.append({
-                "LCDS Mention": title, "Summary": summary[:300],
-                "Link": entry.link, "Date Available Online": dt,
-                "Type": "Media Mention", "Source": f"{engine.capitalize()} News", "Name": query
+                "LCDS Mention": title,
+                "Summary": summary[:500],
+                "Link": entry.link,
+                "Date Available Online": dt,
+                "Type": "Media Mention",
+                "Source": "Google News",
+                "Name": query # Keeps the original name (e.g., Melinda Mills)
             })
         return results
     except Exception as e:
-        print(f"  [!] {engine.capitalize()} Error for {query}: {e}")
+        # Fail silently in threads to keep moving
         return []
 
-def fetch_crossref_events(doi, author_name):
-    if not doi or "doi.org" not in str(doi): return []
-    clean_doi = str(doi).split("doi.org/")[-1].strip()
-    url = f"https://api.eventdata.crossref.org/v1/events?obj-id={clean_doi}&rows=5&mailto=admin@lcds.ox.ac.uk"
-    try:
-        r = requests.get(url, timeout=8)
-        if r.status_code != 200: return []
-        events = []
-        for item in r.json().get('message', {}).get('events', []):
-            if item.get('source_id') in ['newsfeed', 'wikipedia', 'reddit-links']:
-                events.append({
-                    "LCDS Mention": f"Mention in {item['source_id'].capitalize()}",
-                    "Summary": f"Paper discussed on {item['source_id']}.",
-                    "Link": item.get('subj', {}).get('pid') or item.get('subj', {}).get('url'),
-                    "Date Available Online": item.get('occurred_at', '')[:10],
-                    "Type": "Impact / Social", "Source": f"Crossref ({item['source_id']})", "Name": author_name
-                })
-        return events
-    except: return []
-
-def fetch_altmetric_free(doi, author_name):
-    if not doi or "doi.org" not in str(doi): return []
-    clean_doi = str(doi).split("doi.org/")[-1].strip()
-    try:
-        r = requests.get(f"https://api.altmetric.com/v1/doi/{clean_doi}", timeout=5)
-        if r.status_code != 200: return []
-        events = []
-        posts = r.json().get('posts', {})
-        if 'news' in posts:
-            for post in posts['news'][:2]:
-                events.append({
-                    "LCDS Mention": post.get('name', 'News Mention'),
-                    "Summary": post.get('summary', 'News via Altmetric'),
-                    "Link": post.get('url'), "Date Available Online": post.get('posted_on', '')[:10],
-                    "Type": "Media (Altmetric)", "Source": "Altmetric", "Name": author_name
-                })
-        return events
-    except: return []
-
-def get_author_works(orcid):
-    if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan': return [], []
+def fetch_openalex_impact(orcid, name):
+    """
+    Checks recent papers (titles) and citations.
+    """
+    if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan':
+        return []
+        
     orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
+    # Fetch recent works
+    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=5"
+    
+    results = []
     try:
-        r = requests.get(f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=10", timeout=12)
+        r = requests.get(url, timeout=10)
         data = r.json()
-        dois, titles = [], []
+        
         for item in data.get('results', []):
-            if item.get('doi'): dois.append(item['doi'])
-            if item.get('title') and len(item['title'].split()) > 5: titles.append(item['title'])
-        return dois, titles
-    except Exception as e:
-        print(f"  [!] OpenAlex Error: {e}")
-        return [], []
+            title = item.get('title')
+            # If we find a paper, check if IT is in the news
+            if title and len(title.split()) > 5:
+                # Recursive check: Search news for this paper title
+                paper_news = fetch_google_news(f'"{title}"')
+                for p in paper_news:
+                    p['Type'] = "Media (via Paper)"
+                    p['Name'] = name
+                    results.append(p)
+    except:
+        pass
+    return results
+
+def process_person(row):
+    """
+    The worker function that runs in parallel for each person.
+    """
+    name = row['Name']
+    orcid = row['ORCID']
+    person_results = []
+    
+    # 1. Search Media for Name (Smart Query)
+    person_results.extend(fetch_google_news(name))
+    
+    # 2. Search Impact (Papers)
+    person_results.extend(fetch_openalex_impact(orcid, name))
+    
+    return person_results
 
 # --- MAIN ---
 def main():
+    print("--- Starting LCDS Parallel Tracker ---")
     start_time = time.time()
-    print("--- LCDS Media Tracker Bot: Execution Started ---")
     
+    # 1. Load Data
     try:
         df_people = pd.read_csv(INPUT_FILE, encoding='latin1')
-        df_people = df_people[df_people['Status'] != 'Ignore']
+        # Filter: Ensure we are only tracking verified/active people if needed
+        if 'Status' in df_people.columns:
+            df_people = df_people[df_people['Status'] != 'Ignore']
         print(f"Loaded {len(df_people)} people.")
     except Exception as e:
-        print(f"FATAL: Load CSV Error: {e}"); return
+        print(f"Error loading CSV: {e}"); return
 
+    # 2. Load Existing DB
     existing_links = set()
     if os.path.exists(OUTPUT_FILE):
         try:
@@ -132,57 +146,61 @@ def main():
 
     new_records = []
 
-    # 1. RSS FEEDS
-    print("Checking Oxford RSS Feeds...")
-    for feed in OXFORD_RSS_URLS:
-        for i in fetch_news_rss(feed, "google", strict_filter=True):
-            if str(i['Link']) not in existing_links:
-                i['Name'] = "LCDS General"
-                new_records.append(i); existing_links.add(str(i['Link']))
+    # 3. SCAN GENERAL CENTRE NEWS (Targeted)
+    print("Scanning Centre News...")
+    for query in CENTRE_QUERIES:
+        hits = fetch_google_news(query)
+        for h in hits:
+            h['Name'] = "LCDS General"
+            if str(h['Link']) not in existing_links:
+                new_records.append(h)
+                existing_links.add(str(h['Link']))
 
-    # 2. PEOPLE LOOP
-    for idx, row in df_people.iterrows():
-        name, orcid = str(row['Name']), row['ORCID']
+    # 4. SCAN PEOPLE (PARALLEL)
+    print("Scanning People (Parallel Execution)...")
+    
+    # We use max_workers=5 to be polite to Google. 
+    # Too high (e.g. 20) = instant 429 Block.
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        future_to_person = {executor.submit(process_person, row): row['Name'] for _, row in df_people.iterrows()}
         
-        # Check for global script timeout (15 mins)
-        if time.time() - start_time > 900:
-            print("!!! REACHED 15 MINUTE LIMIT: Saving partial results and exiting...")
-            break
+        # Process as they complete
+        for i, future in enumerate(as_completed(future_to_person)):
+            person_name = future_to_person[future]
+            try:
+                results = future.result()
+                count = 0
+                for res in results:
+                    if str(res['Link']) not in existing_links:
+                        new_records.append(res)
+                        existing_links.add(str(res['Link']))
+                        count += 1
+                
+                # Optional: Print status every 10 people
+                if (i+1) % 10 == 0:
+                    print(f"  Processed {i+1}/{len(df_people)} profiles...")
+                    
+            except Exception as exc:
+                print(f"  Error processing {person_name}: {exc}")
 
-        print(f"[{idx+1}/{len(df_people)}] Processing: {name}")
-        
-        # Name News
-        new_records.extend([h for h in fetch_news_rss(name, "google", True) if str(h['Link']) not in existing_links])
-        new_records.extend([h for h in fetch_news_rss(name, "bing", True) if str(h['Link']) not in existing_links])
-
-        # Impact mentions
-        if pd.notna(orcid) and str(orcid).lower() != 'nan':
-            dois, titles = get_author_works(orcid)
-            for doi in dois:
-                for ev in fetch_crossref_events(doi, name) + fetch_altmetric_free(doi, name):
-                    if str(ev['Link']) not in existing_links:
-                        new_records.append(ev); existing_links.add(str(ev['Link']))
-            
-            for title in titles[:1]: # Limit to 1 paper title to save time
-                for h in fetch_news_rss(f'"{title}"', "google", False):
-                    if str(h['Link']) not in existing_links:
-                        h.update({"Type": "Media (via Paper)", "Name": name})
-                        new_records.append(h); existing_links.add(str(h['Link']))
-        
-        time.sleep(0.5)
-
-    print(f"\nScan Complete. New entries found: {len(new_records)}")
+    # 5. SAVE
+    print(f"Scan finished in {round(time.time() - start_time, 2)}s. Found {len(new_records)} new items.")
+    
     if new_records:
         df_new = pd.DataFrame(new_records)
         df_final = pd.concat([df_existing, df_new], ignore_index=True)
+        
+        # Formatting
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
         df_final['Year'] = df_final['Date Available Online'].dt.year
         df_final.sort_values(by='Date Available Online', ascending=False, inplace=True)
         df_final['Date Available Online'] = df_final['Date Available Online'].dt.date
+        
         df_final.to_csv(OUTPUT_FILE, index=False)
-        print(f"SUCCESS: {OUTPUT_FILE} has been updated.")
+        print("SUCCESS: Database updated.")
     else:
-        print("No new data to record.")
+        print("No new data.")
 
 if __name__ == "__main__":
     main()

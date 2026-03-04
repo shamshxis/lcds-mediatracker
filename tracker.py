@@ -10,23 +10,18 @@ from bs4 import BeautifulSoup
 # --- CONFIGURATION ---
 INPUT_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-START_DATE_FILTER = "2023-01-01"  # Adjust start date as needed
+START_DATE_FILTER = "2023-01-01"
 
-# 1. CONTEXT KEYWORDS (Noise Filter)
 CONTEXT_KEYWORDS = [
     "Oxford", "Leverhulme", "LCDS", "Demographic", "Population", 
-    "Sociology", "Nuffield", "Social Science", "Study", "Research",
-    "University", "Professor", "Dr", "Scientist"
+    "Sociology", "Nuffield", "Social Science", "Study", "Research"
 ]
 
-# 2. OFFICIAL FEEDS
 OXFORD_RSS_URLS = [
     "https://www.ox.ac.uk/feeds/rss/news",
     "https://www.oxfordmail.co.uk/news/rss/",
-    "https://www.sociology.ox.ac.uk/news/rss",
 ]
 
-# --- HELPERS ---
 def clean_html(text):
     if not text: return ""
     return BeautifulSoup(text, "html.parser").get_text()
@@ -36,238 +31,156 @@ def is_relevant(text, keywords):
     text_lower = text.lower()
     return any(k.lower() in text_lower for k in keywords)
 
-# --- ENGINE 1: NEWS RSS (Google & Bing) ---
+# --- SEARCH ENGINES ---
 def fetch_news_rss(query, engine="google", strict_filter=False):
     encoded = urllib.parse.quote(query)
-    
-    if engine == "google":
-        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
-        source_label = "Google News"
-    else: 
-        url = f"https://www.bing.com/news/search?q={encoded}&format=rss"
-        source_label = "Bing News"
-
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en" if engine == "google" else f"https://www.bing.com/news/search?q={encoded}&format=rss"
+    source_label = "Google News" if engine == "google" else "Bing News"
     try:
-        feed = feedparser.parse(url) # Standard user agent usually fine for RSS
+        feed = feedparser.parse(url)
         results = []
         for entry in feed.entries:
             title = entry.title
             summary = clean_html(getattr(entry, 'summary', ''))
-            link = entry.link
-            
             try:
                 dt = pd.to_datetime(entry.published).date()
             except:
                 dt = date.today()
-
-            full_text = f"{title} {summary}"
-            if strict_filter and not is_relevant(full_text, CONTEXT_KEYWORDS):
+            if strict_filter and not is_relevant(f"{title} {summary}", CONTEXT_KEYWORDS):
                 continue
-            
             results.append({
-                "LCDS Mention": title,
-                "Summary": summary[:300] + "...",
-                "Link": link,
-                "Date Available Online": dt,
-                "Type": "Media Mention",
-                "Source": source_label,
-                "Name": query
+                "LCDS Mention": title, "Summary": summary[:300] + "...",
+                "Link": entry.link, "Date Available Online": dt,
+                "Type": "Media Mention", "Source": source_label, "Name": query
             })
         return results
-    except Exception:
-        return []
+    except: return []
 
-# --- ENGINE 2: CROSSREF EVENT DATA (Free & Open) ---
 def fetch_crossref_events(doi, author_name):
     if not doi or "doi.org" not in str(doi): return []
     clean_doi = str(doi).split("doi.org/")[-1].strip()
-    
     url = f"https://api.eventdata.crossref.org/v1/events?obj-id={clean_doi}&rows=5&mailto=admin@lcds.ox.ac.uk"
-    
     try:
         r = requests.get(url, timeout=5)
         if r.status_code != 200: return []
-        
-        data = r.json()
         events = []
-        for item in data.get('message', {}).get('events', []):
-            source_id = item.get('source_id')
-            if source_id in ['newsfeed', 'wikipedia', 'reddit-links', 'web']:
-                subj = item.get('subj', {})
-                link = subj.get('pid') or subj.get('url')
-                
+        for item in r.json().get('message', {}).get('events', []):
+            if item.get('source_id') in ['newsfeed', 'wikipedia', 'reddit-links', 'web']:
                 events.append({
-                    "LCDS Mention": f"Mention in {source_id.capitalize()}",
-                    "Summary": f"Paper ({clean_doi}) discussed on {source_id}.",
-                    "Link": link,
+                    "LCDS Mention": f"Mention in {item['source_id'].capitalize()}",
+                    "Summary": f"Paper discussed on {item['source_id']}.",
+                    "Link": item.get('subj', {}).get('pid') or item.get('subj', {}).get('url'),
                     "Date Available Online": item.get('occurred_at', '')[:10],
-                    "Type": "Impact / Social",
-                    "Source": f"Crossref ({source_id})",
-                    "Name": author_name
+                    "Type": "Impact / Social", "Source": f"Crossref ({item['source_id']})", "Name": author_name
                 })
         return events
-    except Exception:
-        return []
+    except: return []
 
-# --- ENGINE 3: ALTMETRIC FREE API (Backup) ---
 def fetch_altmetric_free(doi, author_name):
-    """
-    Queries the free Altmetric API for basic stats and links.
-    Fail-safe: Ignores errors silently.
-    """
     if not doi or "doi.org" not in str(doi): return []
     clean_doi = str(doi).split("doi.org/")[-1].strip()
-    
-    # API Endpoint for specific DOI
-    url = f"https://api.altmetric.com/v1/doi/{clean_doi}"
-    
     try:
-        r = requests.get(url, timeout=3) # Short timeout to not slow down script
-        if r.status_code != 200: return [] # 404 means no data or blocked
-        
+        r = requests.get(f"https://api.altmetric.com/v1/doi/{clean_doi}", timeout=3)
+        if r.status_code != 200: return []
         data = r.json()
         events = []
-        
-        # Check if there are ANY posts
-        if data.get('posts'):
-            # Extract News if available
-            if 'news' in data['posts']:
-                for post in data['posts']['news'][:3]: # Limit to top 3
-                    events.append({
-                        "LCDS Mention": post.get('name', 'News Mention'),
-                        "Summary": post.get('summary', 'News mention tracked by Altmetric'),
-                        "Link": post.get('url'),
-                        "Date Available Online": post.get('posted_on', '')[:10],
-                        "Type": "Media (Altmetric)",
-                        "Source": "Altmetric",
-                        "Name": author_name
-                    })
-                    
-            # Extract Blogs if available
-            if 'blogs' in data['posts']:
-                for post in data['posts']['blogs'][:2]:
-                    events.append({
-                        "LCDS Mention": post.get('title', 'Blog Mention'),
-                        "Summary": post.get('summary', 'Blog mention tracked by Altmetric'),
-                        "Link": post.get('url'),
-                        "Date Available Online": post.get('posted_on', '')[:10],
-                        "Type": "Blog (Altmetric)",
-                        "Source": "Altmetric",
-                        "Name": author_name
-                    })
+        if 'news' in data.get('posts', {}):
+            for post in data['posts']['news'][:3]:
+                events.append({
+                    "LCDS Mention": post.get('name', 'News Mention'),
+                    "Summary": post.get('summary', 'News tracked by Altmetric'),
+                    "Link": post.get('url'), "Date Available Online": post.get('posted_on', '')[:10],
+                    "Type": "Media (Altmetric)", "Source": "Altmetric", "Name": author_name
+                })
         return events
-    except Exception:
-        return []
+    except: return []
 
-# --- ENGINE 4: OPENALEX (Discovery) ---
 def get_author_works(orcid):
     if pd.isna(orcid) or str(orcid).strip() == "": return [], []
     orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
-    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=15"
-    
     try:
-        r = requests.get(url, headers={'User-Agent': 'LCDS_Tracker/1.0'})
-        if r.status_code != 200: return [], []
+        r = requests.get(f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=15", timeout=10)
         data = r.json()
-        dois = []
-        titles = []
+        dois, titles = [], []
         for item in data.get('results', []):
             if item.get('doi'): dois.append(item['doi'])
-            t = item.get('title', '')
-            if t and len(t.split()) > 5: titles.append(t)
+            if item.get('title') and len(item['title'].split()) > 5: titles.append(item['title'])
         return dois, titles
-    except:
-        return [], []
+    except: return [], []
 
 # --- MAIN WORKFLOW ---
 def main():
     print("--- Starting LCDS Media Tracker ---")
-    
     try:
+        # Load academic list with latin1 to handle Excel CSV characters
         df_people = pd.read_csv(INPUT_FILE, encoding='latin1')
-        if 'Status' in df_people.columns:
-            df_people = df_people[df_people['Status'] != 'Ignore']
+        df_people = df_people[df_people['Status'] != 'Ignore']
     except Exception as e:
-        print(f"CRITICAL: Could not load CSV. {e}")
-        return
+        print(f"Error loading CSV: {e}"); return
 
-    # Load Existing Data
+    # Load existing tracking database if it exists
     existing_links = set()
     if os.path.exists(OUTPUT_FILE):
         try:
             df_existing = pd.read_csv(OUTPUT_FILE)
             existing_links = set(df_existing['Link'].astype(str))
-        except:
-            df_existing = pd.DataFrame()
-    else:
-        df_existing = pd.DataFrame()
+        except: df_existing = pd.DataFrame()
+    else: df_existing = pd.DataFrame()
 
     new_records = []
 
-    # 1. OFFICIAL FEEDS
-    print("Checking Official Feeds...")
+    # 1. SCAN GLOBAL RSS FEEDS
     for feed in OXFORD_RSS_URLS:
-        items = fetch_news_rss(feed, "google", strict_filter=True)
-        for i in items:
+        for i in fetch_news_rss(feed, "google", strict_filter=True):
             i['Name'] = "LCDS General"
             if str(i['Link']) not in existing_links:
-                new_records.append(i)
-                existing_links.add(str(i['Link']))
+                new_records.append(i); existing_links.add(str(i['Link']))
 
-    # 2. PEOPLE SCAN
-    for idx, row in df_people.iterrows():
-        name = row['Name']
-        orcid = row['ORCID']
+    # 2. SCAN PEOPLE AND PUBLICATIONS
+    for _, row in df_people.iterrows():
+        name, orcid = row['Name'], row['ORCID']
         print(f"Scanning: {name}")
-
-        # A. Name Search (Google & Bing)
-        media_hits = fetch_news_rss(name, "google", strict_filter=True)
-        media_hits += fetch_news_rss(name, "bing", strict_filter=True)
         
-        for hit in media_hits:
+        # Name Search in Google and Bing
+        for hit in fetch_news_rss(name, "google", strict_filter=True) + fetch_news_rss(name, "bing", strict_filter=True):
             if str(hit['Link']) not in existing_links:
-                new_records.append(hit)
-                existing_links.add(str(hit['Link']))
+                new_records.append(hit); existing_links.add(str(hit['Link']))
 
-        # B. Paper Search (via OpenAlex DOIs)
+        # Impact and Paper title mentions
         if pd.notna(orcid):
             dois, titles = get_author_works(orcid)
-            
             for doi in dois:
-                # 1. Check Crossref (Primary Free Source)
-                events = fetch_crossref_events(doi, name)
-                
-                # 2. Check Altmetric (Backup Source)
-                alt_events = fetch_altmetric_free(doi, name)
-                
-                # Merge lists
-                for event in events + alt_events:
+                for event in fetch_crossref_events(doi, name) + fetch_altmetric_free(doi, name):
                     if str(event['Link']) not in existing_links:
-                        new_records.append(event)
-                        existing_links.add(str(event['Link']))
-            
-            # 3. Check Paper Titles in News
-            for title in titles[:2]: # Top 2 recent only
-                title_hits = fetch_news_rss(f'"{title}"', "google", strict_filter=False)
-                for hit in title_hits:
-                    hit['Type'] = "Media (via Paper)"
-                    hit['Name'] = name
+                        new_records.append(event); existing_links.add(str(event['Link']))
+            for title in titles[:2]:
+                for hit in fetch_news_rss(f'"{title}"', "google", strict_filter=False):
+                    hit.update({"Type": "Media (via Paper)", "Name": name})
                     if str(hit['Link']) not in existing_links:
-                        new_records.append(hit)
-                        existing_links.add(str(hit['Link']))
-        
-        time.sleep(1) # Respect rate limits
+                        new_records.append(hit); existing_links.add(str(hit['Link']))
+        time.sleep(0.5)
 
-    # 3. SAVE
+    # 3. CONSOLIDATE, UNIFY DATE TYPES, AND SAVE
     if new_records:
         df_new = pd.DataFrame(new_records)
-        df_new['Year'] = pd.to_datetime(df_new['Date Available Online'], errors='coerce').dt.year
         df_final = pd.concat([df_existing, df_new], ignore_index=True)
+
+        # UNIFY DATE TYPES: Convert column to actual datetimes so sorting works
+        df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
+        
+        # Re-derive Year from valid dates
+        df_final['Year'] = df_final['Date Available Online'].dt.year
+        
+        # Sort by Date Available Online (Descending)
         df_final.sort_values(by='Date Available Online', ascending=False, inplace=True)
+        
+        # Format back to simple date string (YYYY-MM-DD) for clean CSV display
+        df_final['Date Available Online'] = df_final['Date Available Online'].dt.date
+        
         df_final.to_csv(OUTPUT_FILE, index=False)
-        print(f"SUCCESS: Added {len(new_records)} new records.")
+        print(f"SUCCESS: Added {len(new_records)} records.")
     else:
-        print("No new records found.")
+        print("No new records.")
 
 if __name__ == "__main__":
     main()

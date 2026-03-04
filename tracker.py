@@ -12,15 +12,8 @@ INPUT_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 START_DATE_FILTER = "2023-01-01"
 
-CONTEXT_KEYWORDS = [
-    "Oxford", "Leverhulme", "LCDS", "Demographic", "Population", 
-    "Sociology", "Nuffield", "Social Science", "Study", "Research"
-]
-
-OXFORD_RSS_URLS = [
-    "https://www.ox.ac.uk/feeds/rss/news",
-    "https://www.oxfordmail.co.uk/news/rss/",
-]
+CONTEXT_KEYWORDS = ["Oxford", "Leverhulme", "LCDS", "Demographic", "Population", "Sociology", "Nuffield", "Social Science", "Study", "Research"]
+OXFORD_RSS_URLS = ["https://www.ox.ac.uk/feeds/rss/news", "https://www.oxfordmail.co.uk/news/rss/"]
 
 def clean_html(text):
     if not text: return ""
@@ -31,13 +24,15 @@ def is_relevant(text, keywords):
     text_lower = text.lower()
     return any(k.lower() in text_lower for k in keywords)
 
-# --- SEARCH ENGINES ---
+# --- ENGINES (Now with explicit timeouts) ---
 def fetch_news_rss(query, engine="google", strict_filter=False):
     encoded = urllib.parse.quote(query)
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en" if engine == "google" else f"https://www.bing.com/news/search?q={encoded}&format=rss"
     source_label = "Google News" if engine == "google" else "Bing News"
     try:
-        feed = feedparser.parse(url)
+        # Use requests with a timeout as a wrapper for feedparser to prevent hanging
+        resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0 (LCDS Tracker)'})
+        feed = feedparser.parse(resp.content)
         results = []
         for entry in feed.entries:
             title = entry.title
@@ -54,14 +49,16 @@ def fetch_news_rss(query, engine="google", strict_filter=False):
                 "Type": "Media Mention", "Source": source_label, "Name": query
             })
         return results
-    except: return []
+    except Exception as e:
+        print(f"Skipping {source_label} for {query} due to timeout/error: {e}")
+        return []
 
 def fetch_crossref_events(doi, author_name):
     if not doi or "doi.org" not in str(doi): return []
     clean_doi = str(doi).split("doi.org/")[-1].strip()
     url = f"https://api.eventdata.crossref.org/v1/events?obj-id={clean_doi}&rows=5&mailto=admin@lcds.ox.ac.uk"
     try:
-        r = requests.get(url, timeout=5)
+        r = requests.get(url, timeout=10) # Added timeout
         if r.status_code != 200: return []
         events = []
         for item in r.json().get('message', {}).get('events', []):
@@ -80,7 +77,7 @@ def fetch_altmetric_free(doi, author_name):
     if not doi or "doi.org" not in str(doi): return []
     clean_doi = str(doi).split("doi.org/")[-1].strip()
     try:
-        r = requests.get(f"https://api.altmetric.com/v1/doi/{clean_doi}", timeout=3)
+        r = requests.get(f"https://api.altmetric.com/v1/doi/{clean_doi}", timeout=5) # Added timeout
         if r.status_code != 200: return []
         data = r.json()
         events = []
@@ -96,10 +93,10 @@ def fetch_altmetric_free(doi, author_name):
     except: return []
 
 def get_author_works(orcid):
-    if pd.isna(orcid) or str(orcid).strip() == "": return [], []
+    if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid) == "nan": return [], []
     orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
     try:
-        r = requests.get(f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=15", timeout=10)
+        r = requests.get(f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=15", timeout=15)
         data = r.json()
         dois, titles = [], []
         for item in data.get('results', []):
@@ -108,17 +105,15 @@ def get_author_works(orcid):
         return dois, titles
     except: return [], []
 
-# --- MAIN WORKFLOW ---
+# --- MAIN ---
 def main():
-    print("--- Starting LCDS Media Tracker ---")
+    print("--- Starting LCDS Media Tracker Bot ---")
     try:
-        # Load academic list with latin1 to handle Excel CSV characters
         df_people = pd.read_csv(INPUT_FILE, encoding='latin1')
         df_people = df_people[df_people['Status'] != 'Ignore']
     except Exception as e:
         print(f"Error loading CSV: {e}"); return
 
-    # Load existing tracking database if it exists
     existing_links = set()
     if os.path.exists(OUTPUT_FILE):
         try:
@@ -128,26 +123,26 @@ def main():
     else: df_existing = pd.DataFrame()
 
     new_records = []
-
-    # 1. SCAN GLOBAL RSS FEEDS
+    
+    # Global Feeds
     for feed in OXFORD_RSS_URLS:
         for i in fetch_news_rss(feed, "google", strict_filter=True):
             i['Name'] = "LCDS General"
             if str(i['Link']) not in existing_links:
                 new_records.append(i); existing_links.add(str(i['Link']))
 
-    # 2. SCAN PEOPLE AND PUBLICATIONS
+    # People Loop
     for _, row in df_people.iterrows():
         name, orcid = row['Name'], row['ORCID']
-        print(f"Scanning: {name}")
+        print(f"Scanning: {name}...")
         
-        # Name Search in Google and Bing
+        # Name News
         for hit in fetch_news_rss(name, "google", strict_filter=True) + fetch_news_rss(name, "bing", strict_filter=True):
             if str(hit['Link']) not in existing_links:
                 new_records.append(hit); existing_links.add(str(hit['Link']))
 
-        # Impact and Paper title mentions
-        if pd.notna(orcid):
+        # Impact/Paper mentions
+        if pd.notna(orcid) and str(orcid).lower() != 'nan':
             dois, titles = get_author_works(orcid)
             for doi in dois:
                 for event in fetch_crossref_events(doi, name) + fetch_altmetric_free(doi, name):
@@ -160,27 +155,18 @@ def main():
                         new_records.append(hit); existing_links.add(str(hit['Link']))
         time.sleep(0.5)
 
-    # 3. CONSOLIDATE, UNIFY DATE TYPES, AND SAVE
+    print(f"Finalizing... Found {len(new_records)} new entries.")
     if new_records:
         df_new = pd.DataFrame(new_records)
         df_final = pd.concat([df_existing, df_new], ignore_index=True)
-
-        # UNIFY DATE TYPES: Convert column to actual datetimes so sorting works
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
-        
-        # Re-derive Year from valid dates
         df_final['Year'] = df_final['Date Available Online'].dt.year
-        
-        # Sort by Date Available Online (Descending)
         df_final.sort_values(by='Date Available Online', ascending=False, inplace=True)
-        
-        # Format back to simple date string (YYYY-MM-DD) for clean CSV display
         df_final['Date Available Online'] = df_final['Date Available Online'].dt.date
-        
         df_final.to_csv(OUTPUT_FILE, index=False)
-        print(f"SUCCESS: Added {len(new_records)} records.")
+        print("SUCCESS: Database updated.")
     else:
-        print("No new records.")
+        print("No new data to save.")
 
 if __name__ == "__main__":
     main()

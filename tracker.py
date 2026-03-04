@@ -26,8 +26,7 @@ def clean_html(text):
 
 # --- ENGINE 1: GOOGLE NEWS (Smart Query) ---
 def fetch_google_news(query):
-    # If the query is a person's name, force "Oxford" or "LCDS" context 
-    # to avoid "John Smith" (Plumber) vs "John Smith" (Professor).
+    # Smart Query: Forces "Oxford" or "LCDS" context for names
     if "Leverhulme" not in query and "LCDS" not in query: 
         smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Sociology")'
     else:
@@ -37,7 +36,6 @@ def fetch_google_news(query):
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
     
     try:
-        # Timeout is critical for threading
         resp = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0 (LCDS Bot)'})
         feed = feedparser.parse(resp.content)
         results = []
@@ -108,7 +106,7 @@ def fetch_altmetric_free(doi, name):
         
         # Check for News
         if 'news' in data.get('posts', {}):
-            for post in data['posts']['news'][:2]:
+            for post in data['posts']['news'][:3]:
                 events.append({
                     "LCDS Mention": post.get('name', 'News Mention'),
                     "Summary": post.get('summary', 'News tracked by Altmetric'),
@@ -122,11 +120,11 @@ def fetch_altmetric_free(doi, name):
     except:
         return []
 
-# --- ENGINE 4: OPENALEX (Paper Discovery) ---
-def fetch_openalex_papers(orcid, name):
+# --- ENGINE 4: OPENALEX (Discovery Only) ---
+def fetch_openalex_papers(orcid):
     """
-    Fetches papers since Sep 2019.
-    Returns a list of paper objects AND a list of recent titles for news searching.
+    Fetches papers since Sep 2019 purely for Discovery.
+    Does NOT return a record to be saved, only raw data to be searched.
     """
     if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan':
         return []
@@ -134,50 +132,38 @@ def fetch_openalex_papers(orcid, name):
     orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
     url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=20"
     
-    results = []
+    raw_papers = []
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
-        
         for item in data.get('results', []):
-            title = item.get('title')
-            doi = item.get('doi')
-            pub_date = item.get('publication_date')
-            
-            # 1. Archive the Paper itself
-            results.append({
-                "LCDS Mention": title,
-                "Summary": f"Publication (OpenAlex). Citations: {item.get('cited_by_count', 0)}",
-                "Link": doi or item.get('id'),
-                "Date Available Online": pub_date,
-                "Type": "Academic Output",
-                "Source": "OpenAlex",
-                "Name": name,
-                "DOI_Ref": doi # Internal use only
+            raw_papers.append({
+                'title': item.get('title'),
+                'doi': item.get('doi'),
+                'id': item.get('id')
             })
-            
     except:
         pass
-    return results
+    return raw_papers
 
-# --- WORKER (Runs inside ThreadPool) ---
+# --- WORKER ---
 def process_person(row):
     name = row['Name']
     orcid = row['ORCID']
     person_results = []
     
-    # A. Search Media (Name)
+    # A. Search Media (Name) - Smart Query
     person_results.extend(fetch_google_news(name))
     
-    # B. Search Papers (Since 2019)
-    papers = fetch_openalex_papers(orcid, name)
+    # B. Fetch Papers (Internal Use Only)
+    papers = fetch_openalex_papers(orcid)
     
     for paper in papers:
-        # Add the paper itself to the log
-        person_results.append(paper)
+        doi = paper.get('doi')
+        title = paper.get('title')
         
-        doi = paper.get('DOI_Ref')
-        title = paper.get('LCDS Mention')
+        # We DO NOT save the paper itself anymore. 
+        # We only save what we find ABOUT the paper.
         
         # C. Search Impact (Crossref + Altmetric)
         if doi:
@@ -186,7 +172,6 @@ def process_person(row):
             
         # D. Search Media for Paper Title 
         # (Only for top 3 recent papers to prevent Google blocking)
-        # We assume papers are sorted by date from OpenAlex (default)
         if papers.index(paper) < 3 and title and len(title.split()) > 5:
             news_hits = fetch_google_news(f'"{title}"')
             for hit in news_hits:
@@ -198,7 +183,7 @@ def process_person(row):
 
 # --- MAIN ---
 def main():
-    print("--- LCDS Parallel Tracker (Full Logic) ---")
+    print("--- LCDS Media-Only Tracker (No Raw Pubs) ---")
     start_time = time.time()
     
     # 1. Load Data
@@ -222,7 +207,7 @@ def main():
 
     new_records = []
 
-    # 3. CENTRE NEWS (Targeted)
+    # 3. CENTRE NEWS
     print("Scanning Centre News...")
     for query in CENTRE_QUERIES:
         hits = fetch_google_news(query)
@@ -234,7 +219,6 @@ def main():
 
     # 4. PEOPLE (PARALLEL)
     print("Scanning People (Parallel)...")
-    # We use 5 workers to balance speed vs rate limits
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_person = {executor.submit(process_person, row): row['Name'] for _, row in df_people.iterrows()}
         
@@ -242,18 +226,13 @@ def main():
             try:
                 results = future.result()
                 for res in results:
-                    # Clean up internal keys
-                    if 'DOI_Ref' in res: del res['DOI_Ref']
-                    
                     if str(res['Link']) not in existing_links:
                         new_records.append(res)
                         existing_links.add(str(res['Link']))
-            except Exception as e:
-                # print(f"Error: {e}") # Optional: Uncomment for debugging
-                pass
+            except Exception: pass
 
     # 5. SAVE
-    print(f"Scan finished. Found {len(new_records)} new items.")
+    print(f"Scan finished. Found {len(new_records)} new media mentions.")
     if new_records:
         df_new = pd.DataFrame(new_records)
         df_final = pd.concat([df_existing, df_new], ignore_index=True)

@@ -7,6 +7,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 import re
 
+# --- TEXT CLEANING ---
 def clean_html(text):
     """Removes HTML tags from RSS summaries."""
     if not text: return ""
@@ -16,7 +17,6 @@ def clean_html(text):
 def is_relevant(text, keywords):
     """
     The Noise Filter: Returns True if ANY keyword is found in the text.
-    Case-insensitive.
     """
     if not text: return False
     text_lower = text.lower()
@@ -25,13 +25,14 @@ def is_relevant(text, keywords):
             return True
     return False
 
-def fetch_google_news(query, context_keywords):
+# --- GOOGLE NEWS SEARCH ---
+def fetch_google_news(query, context_keywords=None, strict_filter=False):
     """
-    Fetches news from Google News RSS for a specific query.
-    Applies 'Context Validator' to reduce noise.
+    Fetches news from Google News RSS.
+    If 'strict_filter' is True, it requires at least one context keyword to be present.
     """
     encoded_query = urllib.parse.quote(query)
-    # targeting UK news (gl=GB) in English (hl=en-GB)
+    # UK News, English
     url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-GB&gl=GB&ceid=GB:en"
     
     feed = feedparser.parse(url)
@@ -39,66 +40,75 @@ def fetch_google_news(query, context_keywords):
     
     for entry in feed.entries:
         title = entry.title
-        link = entry.link
-        published = entry.published
-        # RSS summary is often HTML
         summary_raw = getattr(entry, 'summary', '')
         summary_clean = clean_html(summary_raw)
+        link = entry.link
+        published = entry.published
         
-        # COMBINED TEXT for filtering
+        # Determine Relevance
         full_text = f"{title} {summary_clean}"
-        
-        # FILTER: Only keep if it matches context keywords
-        if is_relevant(full_text, context_keywords):
+        keep = True
+        if strict_filter and context_keywords:
+            keep = is_relevant(full_text, context_keywords)
+            
+        if keep:
             results.append({
                 "Date": published,
-                "Entity/Author": query,
+                "Query": query,
                 "Title": title,
                 "Source": entry.source.get('title', 'Unknown'),
                 "Link": link,
-                "Type": "Media",
-                "Snippet": summary_clean[:150] + "..."
+                "Type": "News Mention",
+                "Snippet": summary_clean[:200]
             })
             
     return results
 
-def fetch_openalex_talks(author_name):
+# --- OPENALEX (ACADEMIC DATA) ---
+def fetch_openalex_works(orcid, name):
     """
-    Uses OpenAlex to find 'other' works (preprints, paratext) 
-    that might indicate talks or keynotes.
+    Uses ORCID to fetch recent works from OpenAlex.
+    Returns:
+    1. A list of recent 'Talks/Preprints' (for the dashboard)
+    2. A list of recent 'Article Titles' (to feed into the News Search)
     """
-    # Search for the author first to get their ID (simplified for this demo)
-    # In a production app, you might want to cache Author IDs.
-    
-    # We search works directly by author name to save an API call, 
-    # filtering for 'other' or 'paratext' types.
-    url = f"https://api.openalex.org/works?filter=author.search:{author_name},type:other&per-page=5"
+    if not orcid or str(orcid) == "nan":
+        return [], []
+        
+    # OpenAlex API expects full ORCID URL usually, but works with simple ID in filters
+    orcid_id = orcid.replace("https://orcid.org/", "")
+    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id}&sort=publication_date:desc&per-page=5"
     
     try:
         r = requests.get(url, timeout=5)
         if r.status_code != 200:
-            return []
-        
+            return [], []
+            
         data = r.json()
-        talks = []
+        works_log = []
+        paper_titles = []
         
         for work in data.get('results', []):
-            # Try to grab a conference name if available
-            source = "OpenAlex"
-            if work.get('primary_location') and work['primary_location'].get('source'):
-                 source = work['primary_location']['source'].get('display_name', 'OpenAlex')
-
-            talks.append({
-                "Date": work.get('publication_date', 'Unknown'),
-                "Entity/Author": author_name,
-                "Title": work.get('title', 'Untitled'),
-                "Source": source,
+            title = work.get('title', 'Untitled')
+            pub_date = work.get('publication_date', '')
+            
+            # Save title for News Search (only if it's a substantial title, > 4 words)
+            if title and len(title.split()) > 4:
+                paper_titles.append(title)
+            
+            # Log as a work record
+            works_log.append({
+                "Date": pub_date,
+                "Query": name,
+                "Title": title,
+                "Source": work.get('primary_location', {}).get('source', {}).get('display_name', 'OpenAlex'),
                 "Link": work.get('doi', work.get('id')),
-                "Type": "Talk/Keynote (Potential)",
-                "Snippet": "Sourced via OpenAlex type:other"
+                "Type": "Academic Output",
+                "Snippet": f"Type: {work.get('type', 'article')}"
             })
-        return talks
+            
+        return works_log, paper_titles
         
     except Exception as e:
-        print(f"OpenAlex Error for {author_name}: {e}")
-        return []
+        print(f"Error fetching OpenAlex for {name}: {e}")
+        return [], []

@@ -55,7 +55,7 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # --- NEW: TYPE FILTER (Find Keynotes) ---
+    # Type Filter
     all_types = sorted(df_filtered['Type'].dropna().unique().tolist())
     selected_types = st.multiselect("Category (e.g. Keynote)", all_types)
     
@@ -90,12 +90,20 @@ df_display['Date'] = df_display['Date Available Online'].dt.strftime('%Y-%m-%d')
 
 st.dataframe(
     df_display[[
-        "Type", "LCDS Mention", "Name", "Source", "Date", "Link"
+        "Type", "Name", "LCDS Mention", "Snippet", "Link", "Date"
     ]],
     column_config={
-        "Link": st.column_config.LinkColumn("Link"),
+        "Link": st.column_config.LinkColumn(
+            "Link", 
+            display_text="View Here"  # <--- This creates the clean button
+        ),
+        "Snippet": st.column_config.TextColumn(
+            "Context Snippet", 
+            width="large",
+            help="The text found by the tracker that matched the query."
+        ),
         "Type": st.column_config.TextColumn("Category", width="small"),
-        "LCDS Mention": st.column_config.TextColumn("Title / Summary", width="large"),
+        "LCDS Mention": st.column_config.TextColumn("Title", width="medium"),
     },
     use_container_width=True,
     hide_index=True
@@ -106,6 +114,6 @@ csv = df_filtered.to_csv(index=False).encode('utf-8')
 st.download_button(
     label=f"Download CSV ({time_filter})", 
     data=csv, 
-    file_name=f"lcds_media_keynotes.csv", 
+    file_name=f"lcds_media_tracker.csv", 
     mime="text/csv"
 )

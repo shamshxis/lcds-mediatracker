@@ -1,6 +1,7 @@
+streamlit
 pandas
-requests
 feedparser
+requests
 beautifulsoup4
 lxml
 openpyxl

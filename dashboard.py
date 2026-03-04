@@ -33,7 +33,7 @@ if df.empty:
 with st.sidebar:
     st.header("🔍 Filters")
     
-    # --- TIME PERIOD FILTER (Like Pubs Tracker) ---
+    # --- TIME PERIOD FILTER ---
     time_filter = st.radio(
         "Time Period",
         ["All Data (Since Sep 2019)", "Last Year", "Last Month", "Last Week"],
@@ -49,7 +49,7 @@ with st.sidebar:
     elif time_filter == "Last Year":
         start_date = today - timedelta(days=365)
     else:
-        start_date = pd.Timestamp("2019-09-01") # Start of LCDS
+        start_date = pd.Timestamp("2019-09-01") 
 
     # Filter by Date
     df_filtered = df[df['Date Available Online'] >= start_date].copy()
@@ -57,7 +57,6 @@ with st.sidebar:
     st.markdown("---")
     
     # --- ACADEMIC FILTER ---
-    # Only show names that exist in the filtered date range
     available_names = sorted(df_filtered['Name'].dropna().unique().tolist())
     selected_names = st.multiselect("Academic / Project", available_names)
     
@@ -80,7 +79,6 @@ c2.metric("Unique Academics", df_filtered['Name'].nunique())
 c3.metric("Date Range", f"{start_date.date()} to Now")
 
 # 5. DATA TABLE
-# Format dates for display
 df_display = df_filtered.copy()
 df_display['Date'] = df_display['Date Available Online'].dt.strftime('%Y-%m-%d')
 

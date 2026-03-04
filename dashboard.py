@@ -33,14 +33,14 @@ if df.empty:
 with st.sidebar:
     st.header("🔍 Filters")
     
-    # --- TIME PERIOD FILTER ---
+    # Time Period
     time_filter = st.radio(
         "Time Period",
-        ["All Data (Since Sep 2019)", "Last Year", "Last Month", "Last Week"],
+        ["All Data", "Last Year", "Last Month", "Last Week"],
         index=0
     )
     
-    # Date Calculation
+    # Date Logic
     today = pd.Timestamp.now()
     if time_filter == "Last Week":
         start_date = today - timedelta(days=7)
@@ -51,20 +51,26 @@ with st.sidebar:
     else:
         start_date = pd.Timestamp("2019-09-01") 
 
-    # Filter by Date
     df_filtered = df[df['Date Available Online'] >= start_date].copy()
     
     st.markdown("---")
     
-    # --- ACADEMIC FILTER ---
-    available_names = sorted(df_filtered['Name'].dropna().unique().tolist())
-    selected_names = st.multiselect("Academic / Project", available_names)
+    # --- NEW: TYPE FILTER (Find Keynotes) ---
+    all_types = sorted(df_filtered['Type'].dropna().unique().tolist())
+    selected_types = st.multiselect("Category (e.g. Keynote)", all_types)
     
-    # --- SOURCE FILTER ---
+    # Academic Filter
+    available_names = sorted(df_filtered['Name'].dropna().unique().tolist())
+    selected_names = st.multiselect("Academic", available_names)
+    
+    # Source Filter
     available_sources = sorted(df_filtered['Source'].dropna().unique().tolist())
     selected_source = st.multiselect("Source", available_sources)
 
 # 3. APPLY FILTERS
+if selected_types:
+    df_filtered = df_filtered[df_filtered['Type'].isin(selected_types)]
+
 if selected_names:
     df_filtered = df_filtered[df_filtered['Name'].isin(selected_names)]
 
@@ -74,9 +80,9 @@ if selected_source:
 # 4. METRICS
 st.markdown(f"### Showing: {time_filter}")
 c1, c2, c3 = st.columns(3)
-c1.metric("Mentions Found", len(df_filtered))
-c2.metric("Unique Academics", df_filtered['Name'].nunique())
-c3.metric("Date Range", f"{start_date.date()} to Now")
+c1.metric("Items Found", len(df_filtered))
+c2.metric("Keynotes/Talks", len(df_filtered[df_filtered['Type'].str.contains("Keynote", na=False)]))
+c3.metric("Unique People", df_filtered['Name'].nunique())
 
 # 5. DATA TABLE
 df_display = df_filtered.copy()
@@ -84,11 +90,12 @@ df_display['Date'] = df_display['Date Available Online'].dt.strftime('%Y-%m-%d')
 
 st.dataframe(
     df_display[[
-        "LCDS Mention", "Name", "Source", "Date", "Link", "Summary"
+        "Type", "LCDS Mention", "Name", "Source", "Date", "Link"
     ]],
     column_config={
         "Link": st.column_config.LinkColumn("Link"),
-        "Summary": st.column_config.TextColumn("Summary", width="medium"),
+        "Type": st.column_config.TextColumn("Category", width="small"),
+        "LCDS Mention": st.column_config.TextColumn("Title / Summary", width="large"),
     },
     use_container_width=True,
     hide_index=True
@@ -99,6 +106,6 @@ csv = df_filtered.to_csv(index=False).encode('utf-8')
 st.download_button(
     label=f"Download CSV ({time_filter})", 
     data=csv, 
-    file_name=f"lcds_media_{time_filter.replace(' ', '_').lower()}.csv", 
+    file_name=f"lcds_media_keynotes.csv", 
     mime="text/csv"
 )

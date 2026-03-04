@@ -16,31 +16,53 @@ START_DATE_FILTER = "2019-09-01"
 # --- HELPERS ---
 def clean_html(text):
     if not text: return ""
-    return BeautifulSoup(text, "html.parser").get_text()
+    soup = BeautifulSoup(text, "html.parser")
+    for a in soup.findAll('a'): del a['href']
+    return soup.get_text(separator=" ").strip()
 
-def validate_hit(entry, name):
+def extract_snippet(entry):
+    if hasattr(entry, 'summary'): return clean_html(entry.summary)
+    if hasattr(entry, 'description'): return clean_html(entry.description)
+    return ""
+
+def validate_hit(entry, name, paper_titles):
     """
-    Strict Validation: Returns True only if the name appears in the 
-    Title or Snippet. Prevents 'phantom' matches.
+    SMART VALIDATION (v4):
+    1. Check for Name.
+    2. Check for ANY known Paper Title (fuzzy match).
     """
-    content = (entry.title + " " + getattr(entry, 'summary', '')).lower()
-    last_name = name.lower().split()[-1]
+    content = (entry.title + " " + extract_snippet(entry)).lower()
     
-    # 1. Full Name Match (Best)
-    if name.lower() in content: return True
-    
-    # 2. Last Name + Context (Backup)
-    # Accepts "Mills" if "Oxford" or "Demography" is also present
-    if last_name in content and any(x in content for x in ["oxford", "lcds", "demographic", "sociology", "keynote", "conference"]):
+    # Check 1: Name Match
+    if name.lower() in content: 
         return True
         
+    # Check 2: Paper Title Match
+    # If the article mentions "The future of fertility..." (your paper), we keep it.
+    for title in paper_titles:
+        if title and len(title) > 20 and title.lower() in content:
+            return True
+            
     return False
 
-# --- ENGINE 1: GOOGLE NEWS (With Snippet Capture) ---
-def fetch_google_news(query):
-    # Expanded query to hunt for Media AND Keynotes
+# --- ENGINE 1: OPENALEX (Get Titles for Validation) ---
+def fetch_paper_titles(orcid):
+    if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan': return []
+    orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
+    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=10"
+    try:
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        # Return list of clean titles
+        return [i.get('title') for i in data.get('results', []) if i.get('title')]
+    except: return []
+
+# --- ENGINE 2: GOOGLE NEWS (Conference + Media) ---
+def fetch_google_news(query, paper_titles):
+    # EXPANDED QUERY: Captures Media + Major Demography Conferences
     if "Leverhulme" not in query:
-        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Keynote" OR "Plenary" OR "Conference")'
+        # We add PAA, EPC, BSPS, MPIDR, IUSSP to the dragnet
+        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Population" OR "PAA" OR "EPC" OR "BSPS" OR "MPIDR" OR "IUSSP")'
     else:
         smart_query = query
 
@@ -52,12 +74,13 @@ def fetch_google_news(query):
         feed = feedparser.parse(resp.content)
         results = []
         for entry in feed.entries:
-            # VALIDATION: Skip if name isn't actually there
-            if "Leverhulme" not in query and not validate_hit(entry, query): 
+            snippet = extract_snippet(entry)
+            
+            # PASS THE PAPER TITLES FOR VALIDATION
+            if "Leverhulme" not in query and not validate_hit(entry, query, paper_titles): 
                 continue 
 
             title = entry.title
-            snippet = clean_html(getattr(entry, 'summary', ''))
             link = entry.link
             
             try:
@@ -65,18 +88,25 @@ def fetch_google_news(query):
             except:
                 dt = date.today()
 
-            # INTELLIGENT TAGGING
-            text_blob = (title + " " + snippet).lower()
-            if any(x in text_blob for x in ["keynote", "plenary", "panelist", "conference", "speaker"]):
-                item_type = "Keynote / Talk"
-            elif any(x in text_blob for x in ["study", "research", "paper", "journal", "published"]):
+            # INTELLIGENT TAGGING (v4)
+            low_text = (title + " " + snippet).lower()
+            
+            # A. Conferences
+            if any(x in low_text for x in ["paa", "epc", "bsps", "mpidr", "iussp", "conference", "annual meeting", "poster session"]):
+                item_type = "Conference / Talk"
+            # B. Keynotes
+            elif any(x in low_text for x in ["keynote", "plenary", "panelist", "invited speaker"]):
+                item_type = "Keynote"
+            # C. Research/Study
+            elif any(x in low_text for x in ["study", "research", "paper", "journal", "published", "new findings"]):
                 item_type = "Media (Research)"
+            # D. General
             else:
                 item_type = "Media Mention"
 
             results.append({
                 "LCDS Mention": title,
-                "Snippet": snippet[:300], # CAPTURE THE CONTEXT (Limit 300 chars)
+                "Snippet": snippet[:400], 
                 "Link": link,
                 "Date Available Online": dt,
                 "Type": item_type,
@@ -87,143 +117,55 @@ def fetch_google_news(query):
     except:
         return []
 
-# --- ENGINE 2: CROSSREF EVENT DATA ---
-def fetch_crossref_events(doi, name):
-    if not doi or "doi.org" not in str(doi): return []
-    clean_doi = str(doi).split("doi.org/")[-1].strip()
-    url = f"https://api.eventdata.crossref.org/v1/events?obj-id={clean_doi}&rows=5&mailto=admin@lcds.ox.ac.uk"
-    try:
-        r = requests.get(url, timeout=5)
-        if r.status_code != 200: return []
-        events = []
-        for item in r.json().get('message', {}).get('events', []):
-            sid = item.get('source_id')
-            if sid in ['newsfeed', 'wikipedia', 'reddit-links', 'web']:
-                link = item.get('subj', {}).get('pid') or item.get('subj', {}).get('url')
-                occurred = item.get('occurred_at', '')[:10]
-                events.append({
-                    "LCDS Mention": f"Mention in {sid.capitalize()}",
-                    "Snippet": f"Paper ({clean_doi}) discussed on {sid}.",
-                    "Link": link,
-                    "Date Available Online": occurred,
-                    "Type": "Impact / Social",
-                    "Source": f"Crossref ({sid})",
-                    "Name": name
-                })
-        return events
-    except: return []
-
-# --- ENGINE 3: ALTMETRIC FREE ---
-def fetch_altmetric_free(doi, name):
-    if not doi or "doi.org" not in str(doi): return []
-    clean_doi = str(doi).split("doi.org/")[-1].strip()
-    try:
-        r = requests.get(f"https://api.altmetric.com/v1/doi/{clean_doi}", timeout=5)
-        if r.status_code != 200: return []
-        data = r.json()
-        events = []
-        if 'news' in data.get('posts', {}):
-            for post in data['posts']['news'][:2]:
-                events.append({
-                    "LCDS Mention": post.get('name', 'News Mention'),
-                    "Snippet": post.get('summary', 'News tracked by Altmetric')[:300],
-                    "Link": post.get('url'),
-                    "Date Available Online": post.get('posted_on', '')[:10],
-                    "Type": "Media (Altmetric)",
-                    "Source": "Altmetric",
-                    "Name": name
-                })
-        return events
-    except: return []
-
-# --- ENGINE 4: OPENALEX ---
-def fetch_openalex_papers(orcid):
-    if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan': return []
-    orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
-    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=15"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        return [{'title': i.get('title'), 'doi': i.get('doi')} for i in data.get('results', [])]
-    except: return []
-
 # --- WORKER ---
 def process_person(row):
     name = row['Name']
     orcid = row['ORCID']
-    person_results = []
     
-    # A. Search Media & Keynotes (Validated)
-    person_results.extend(fetch_google_news(name))
+    # 1. Get recent paper titles (for validation only)
+    titles = fetch_paper_titles(orcid)
     
-    # B. Fetch Papers (Internal Use)
-    papers = fetch_openalex_papers(orcid)
-    
-    for paper in papers:
-        doi = paper.get('doi')
-        title = paper.get('title')
-        if doi:
-            person_results.extend(fetch_crossref_events(doi, name))
-            person_results.extend(fetch_altmetric_free(doi, name))
-        # C. Viral Paper Check (Top 2 recent only)
-        if papers.index(paper) < 2 and title and len(title.split()) > 5:
-            news_hits = fetch_google_news(f'"{title}"')
-            for hit in news_hits:
-                hit['Type'] = "Media (via Paper)"
-                hit['Name'] = name
-                person_results.append(hit)
-    return person_results
+    # 2. Search Media/Conferences using Name + Titles
+    return fetch_google_news(name, titles)
 
 # --- MAIN ---
 def main():
-    print("--- LCDS Turbo Tracker (20 Workers) ---")
-    
+    print("--- LCDS Conference & Media Tracker (v4) ---")
     try:
-        df_people = pd.read_csv(INPUT_FILE, encoding='latin1')
-        if 'Status' in df_people.columns: df_people = df_people[df_people['Status'] != 'Ignore']
-        print(f"Loaded {len(df_people)} people.")
-    except Exception as e: print(f"Error loading CSV: {e}"); return
+        df_p = pd.read_csv(INPUT_FILE, encoding='latin1')
+        df_p = df_p[df_p['Status'] != 'Ignore']
+    except Exception as e: print(e); return
 
-    # LOAD & CLEAN DB
     existing_links = set()
     if os.path.exists(OUTPUT_FILE):
         try:
             df_existing = pd.read_csv(OUTPUT_FILE)
-            # Cleanup: Remove LCDS General and items with no Title
+            # Cleanup
             df_existing = df_existing[df_existing['Name'] != "LCDS General"]
-            df_existing.dropna(subset=['LCDS Mention'], inplace=True)
+            df_existing.dropna(subset=['Snippet'], inplace=True)
             existing_links = set(df_existing['Link'].astype(str))
         except: df_existing = pd.DataFrame()
     else: df_existing = pd.DataFrame()
 
     new_records = []
-
-    print("Scanning People (Turbo Parallel)...")
-    # TURBO: 20 Workers
+    print("Scanning (Includes PAA, EPC, BSPS, MPIDR)...")
+    
     with ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_person = {executor.submit(process_person, row): row['Name'] for _, row in df_people.iterrows()}
-        for future in as_completed(future_to_person):
+        futures = {executor.submit(process_person, r): r['Name'] for _, r in df_p.iterrows()}
+        for f in as_completed(futures):
             try:
-                for res in future.result():
+                for res in f.result():
                     if str(res['Link']) not in existing_links:
-                        new_records.append(res)
-                        existing_links.add(str(res['Link']))
-            except Exception: pass
+                        new_records.append(res); existing_links.add(str(res['Link']))
+            except: pass
 
-    print(f"Scan finished. Found {len(new_records)} verified items.")
-    if new_records or len(df_existing) > 0:
-        df_new = pd.DataFrame(new_records)
-        df_final = pd.concat([df_existing, df_new], ignore_index=True)
-        
+    if new_records or not df_existing.empty:
+        df_final = pd.concat([df_existing, pd.DataFrame(new_records)], ignore_index=True)
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
-        df_final['Year'] = df_final['Date Available Online'].dt.year
         df_final.sort_values(by='Date Available Online', ascending=False, inplace=True)
         df_final['Date Available Online'] = df_final['Date Available Online'].dt.date
-        
         df_final.to_csv(OUTPUT_FILE, index=False)
-        print("SUCCESS: Database updated.")
-    else:
-        print("No new data.")
+        print(f"Done. Database now has {len(df_final)} records.")
 
 if __name__ == "__main__":
     main()

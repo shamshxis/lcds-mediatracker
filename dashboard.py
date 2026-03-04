@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+from datetime import datetime, timedelta
 
 # CONFIG
 FILE_PATH = "lcds_media_tracker.csv"
@@ -8,16 +9,13 @@ FILE_PATH = "lcds_media_tracker.csv"
 st.set_page_config(page_title="LCDS Tracker", layout="wide")
 st.title("📰 LCDS Media & Impact Dashboard")
 
-# 1. LOAD DATA (Fast & Cached)
-# We use @st.cache_data so it doesn't reload the CSV on every click
-@st.cache_data(ttl=300) # Clears cache every 5 mins to pick up new bot data
+# 1. LOAD DATA
+@st.cache_data(ttl=300)
 def load_data():
     if not os.path.exists(FILE_PATH):
         return pd.DataFrame()
-    
     try:
         df = pd.read_csv(FILE_PATH)
-        # Ensure dates are datetime objects
         df['Date Available Online'] = pd.to_datetime(df['Date Available Online'])
         df['Year'] = df['Date Available Online'].dt.year
         return df
@@ -28,56 +26,81 @@ def load_data():
 df = load_data()
 
 if df.empty:
-    st.info("Waiting for the Tracker Bot to populate data... (Check back in 10 mins)")
+    st.info("Tracker is initializing... please check back after the next scheduled run.")
     st.stop()
 
-# 2. FILTERS (Sidebar)
+# 2. SIDEBAR FILTERS
 with st.sidebar:
-    st.header("Filters")
+    st.header("🔍 Filters")
     
-    # Year Filter
-    all_years = sorted(df['Year'].dropna().unique().astype(int), reverse=True)
-    selected_year = st.selectbox("Year", ["All"] + list(all_years))
+    # --- TIME PERIOD FILTER (Like Pubs Tracker) ---
+    time_filter = st.radio(
+        "Time Period",
+        ["All Data (Since Sep 2019)", "Last Year", "Last Month", "Last Week"],
+        index=0
+    )
     
-    # Name Filter
-    all_names = sorted(df['Name'].dropna().unique().tolist())
-    selected_name = st.multiselect("Academic / Project", all_names)
+    # Date Calculation
+    today = pd.Timestamp.now()
+    if time_filter == "Last Week":
+        start_date = today - timedelta(days=7)
+    elif time_filter == "Last Month":
+        start_date = today - timedelta(days=30)
+    elif time_filter == "Last Year":
+        start_date = today - timedelta(days=365)
+    else:
+        start_date = pd.Timestamp("2019-09-01") # Start of LCDS
+
+    # Filter by Date
+    df_filtered = df[df['Date Available Online'] >= start_date].copy()
     
-    # Source Filter
-    all_sources = sorted(df['Source'].dropna().unique().tolist())
-    selected_source = st.multiselect("Source", all_sources)
+    st.markdown("---")
+    
+    # --- ACADEMIC FILTER ---
+    # Only show names that exist in the filtered date range
+    available_names = sorted(df_filtered['Name'].dropna().unique().tolist())
+    selected_names = st.multiselect("Academic / Project", available_names)
+    
+    # --- SOURCE FILTER ---
+    available_sources = sorted(df_filtered['Source'].dropna().unique().tolist())
+    selected_source = st.multiselect("Source", available_sources)
 
 # 3. APPLY FILTERS
-df_view = df.copy()
+if selected_names:
+    df_filtered = df_filtered[df_filtered['Name'].isin(selected_names)]
 
-if selected_year != "All":
-    df_view = df_view[df_view['Year'] == selected_year]
-
-if selected_name:
-    df_view = df_view[df_view['Name'].isin(selected_name)]
-    
 if selected_source:
-    df_view = df_view[df_view['Source'].isin(selected_source)]
+    df_filtered = df_filtered[df_filtered['Source'].isin(selected_source)]
 
 # 4. METRICS
+st.markdown(f"### Showing: {time_filter}")
 c1, c2, c3 = st.columns(3)
-c1.metric("Total Mentions", len(df_view))
-c2.metric("Academics Mentioned", df_view['Name'].nunique())
-c3.metric("Latest Update", str(df_view['Date Available Online'].max().date()))
+c1.metric("Mentions Found", len(df_filtered))
+c2.metric("Unique Academics", df_filtered['Name'].nunique())
+c3.metric("Date Range", f"{start_date.date()} to Now")
 
 # 5. DATA TABLE
+# Format dates for display
+df_display = df_filtered.copy()
+df_display['Date'] = df_display['Date Available Online'].dt.strftime('%Y-%m-%d')
+
 st.dataframe(
-    df_view[[
-        "LCDS Mention", "Name", "Source", "Date Available Online", "Link", "Summary"
+    df_display[[
+        "LCDS Mention", "Name", "Source", "Date", "Link", "Summary"
     ]],
     column_config={
-        "Link": st.column_config.LinkColumn("Read Article"),
-        "Date Available Online": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+        "Link": st.column_config.LinkColumn("Link"),
+        "Summary": st.column_config.TextColumn("Summary", width="medium"),
     },
     use_container_width=True,
     hide_index=True
 )
 
 # 6. DOWNLOAD
-csv = df_view.to_csv(index=False).encode('utf-8')
-st.download_button("Download Filtered Data", csv, "lcds_impact_report.csv", "text/csv")
+csv = df_filtered.to_csv(index=False).encode('utf-8')
+st.download_button(
+    label=f"Download CSV ({time_filter})", 
+    data=csv, 
+    file_name=f"lcds_media_{time_filter.replace(' ', '_').lower()}.csv", 
+    mime="text/csv"
+)

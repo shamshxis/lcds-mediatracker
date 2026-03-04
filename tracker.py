@@ -20,35 +20,27 @@ def clean_html(text):
 
 def validate_hit(entry, name):
     """
-    STRICT VALIDATION:
-    Returns True only if the academic's name actually appears 
-    in the Title or Summary of the news result.
-    This eliminates "phantom" results where Google matched the topic but not the person.
+    Strict Validation: Returns True only if the name appears in the 
+    Title or Snippet. Prevents 'phantom' matches.
     """
-    # Normalize text for checking
     content = (entry.title + " " + getattr(entry, 'summary', '')).lower()
+    last_name = name.lower().split()[-1]
     
-    # Check for Last Name at minimum, ideally Full Name
-    # We split name to be safe (e.g. "Melinda Mills" -> checks for "Mills")
-    name_parts = name.lower().split()
-    last_name = name_parts[-1]
+    # 1. Full Name Match (Best)
+    if name.lower() in content: return True
     
-    # 1. Strict Check: Full Name (Best)
-    if name.lower() in content:
-        return True
-    
-    # 2. Relaxed Check: Last Name + Context (Backup)
-    # If "Mills" appears AND "Oxford" or "Demographic" appears, we accept it.
-    if last_name in content and ("oxford" in content or "lcds" in content or "leverhulme" in content):
+    # 2. Last Name + Context (Backup)
+    # Accepts "Mills" if "Oxford" or "Demography" is also present
+    if last_name in content and any(x in content for x in ["oxford", "lcds", "demographic", "sociology", "keynote", "conference"]):
         return True
         
     return False
 
-# --- ENGINE 1: GOOGLE NEWS (Strict Mode) ---
+# --- ENGINE 1: GOOGLE NEWS (With Snippet Capture) ---
 def fetch_google_news(query):
-    # Smart Query: Forces "Oxford" or "LCDS" context for names
-    if "Leverhulme" not in query: 
-        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Keynote" OR "Conference")'
+    # Expanded query to hunt for Media AND Keynotes
+    if "Leverhulme" not in query:
+        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Keynote" OR "Plenary" OR "Conference")'
     else:
         smart_query = query
 
@@ -60,14 +52,13 @@ def fetch_google_news(query):
         feed = feedparser.parse(resp.content)
         results = []
         for entry in feed.entries:
-            # --- VALIDATION GATEWAY ---
-            # If the user is a Person (not the Centre), validate the name exists
-            if "Leverhulme" not in query and not validate_hit(entry, query):
-                continue # Skip this result, it's a false positive
-            # --------------------------
+            # VALIDATION: Skip if name isn't actually there
+            if "Leverhulme" not in query and not validate_hit(entry, query): 
+                continue 
 
             title = entry.title
-            summary = clean_html(getattr(entry, 'summary', ''))
+            snippet = clean_html(getattr(entry, 'summary', ''))
+            link = entry.link
             
             try:
                 dt = pd.to_datetime(entry.published).date()
@@ -75,7 +66,7 @@ def fetch_google_news(query):
                 dt = date.today()
 
             # INTELLIGENT TAGGING
-            text_blob = (title + " " + summary).lower()
+            text_blob = (title + " " + snippet).lower()
             if any(x in text_blob for x in ["keynote", "plenary", "panelist", "conference", "speaker"]):
                 item_type = "Keynote / Talk"
             elif any(x in text_blob for x in ["study", "research", "paper", "journal", "published"]):
@@ -85,8 +76,8 @@ def fetch_google_news(query):
 
             results.append({
                 "LCDS Mention": title,
-                "Summary": summary[:500],
-                "Link": entry.link,
+                "Snippet": snippet[:300], # CAPTURE THE CONTEXT (Limit 300 chars)
+                "Link": link,
                 "Date Available Online": dt,
                 "Type": item_type,
                 "Source": "Google News",
@@ -112,7 +103,7 @@ def fetch_crossref_events(doi, name):
                 occurred = item.get('occurred_at', '')[:10]
                 events.append({
                     "LCDS Mention": f"Mention in {sid.capitalize()}",
-                    "Summary": f"Paper ({clean_doi}) discussed on {sid}.",
+                    "Snippet": f"Paper ({clean_doi}) discussed on {sid}.",
                     "Link": link,
                     "Date Available Online": occurred,
                     "Type": "Impact / Social",
@@ -135,7 +126,7 @@ def fetch_altmetric_free(doi, name):
             for post in data['posts']['news'][:2]:
                 events.append({
                     "LCDS Mention": post.get('name', 'News Mention'),
-                    "Summary": post.get('summary', 'News tracked by Altmetric'),
+                    "Snippet": post.get('summary', 'News tracked by Altmetric')[:300],
                     "Link": post.get('url'),
                     "Date Available Online": post.get('posted_on', '')[:10],
                     "Type": "Media (Altmetric)",
@@ -162,10 +153,10 @@ def process_person(row):
     orcid = row['ORCID']
     person_results = []
     
-    # A. Search Media (Validated)
+    # A. Search Media & Keynotes (Validated)
     person_results.extend(fetch_google_news(name))
     
-    # B. Fetch Papers
+    # B. Fetch Papers (Internal Use)
     papers = fetch_openalex_papers(orcid)
     
     for paper in papers:
@@ -174,7 +165,7 @@ def process_person(row):
         if doi:
             person_results.extend(fetch_crossref_events(doi, name))
             person_results.extend(fetch_altmetric_free(doi, name))
-        # C. Viral Paper Check
+        # C. Viral Paper Check (Top 2 recent only)
         if papers.index(paper) < 2 and title and len(title.split()) > 5:
             news_hits = fetch_google_news(f'"{title}"')
             for hit in news_hits:
@@ -185,7 +176,7 @@ def process_person(row):
 
 # --- MAIN ---
 def main():
-    print("--- LCDS Strict Media Tracker ---")
+    print("--- LCDS Turbo Tracker (20 Workers) ---")
     
     try:
         df_people = pd.read_csv(INPUT_FILE, encoding='latin1')
@@ -198,24 +189,18 @@ def main():
     if os.path.exists(OUTPUT_FILE):
         try:
             df_existing = pd.read_csv(OUTPUT_FILE)
-            
-            # --- GARBAGE COLLECTION ---
-            # 1. Remove "LCDS General" (Too noisy)
-            # 2. Remove entries where "LCDS Mention" (Title) is missing/NaN
-            # 3. Remove "phantom" entries found previously (optional, but good hygiene)
-            initial_len = len(df_existing)
+            # Cleanup: Remove LCDS General and items with no Title
             df_existing = df_existing[df_existing['Name'] != "LCDS General"]
             df_existing.dropna(subset=['LCDS Mention'], inplace=True)
-            
-            print(f"Cleaned DB: {initial_len} -> {len(df_existing)} records.")
             existing_links = set(df_existing['Link'].astype(str))
         except: df_existing = pd.DataFrame()
     else: df_existing = pd.DataFrame()
 
     new_records = []
 
-    print("Scanning People (Strict Mode)...")
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    print("Scanning People (Turbo Parallel)...")
+    # TURBO: 20 Workers
+    with ThreadPoolExecutor(max_workers=20) as executor:
         future_to_person = {executor.submit(process_person, row): row['Name'] for _, row in df_people.iterrows()}
         for future in as_completed(future_to_person):
             try:

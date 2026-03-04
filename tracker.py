@@ -13,26 +13,23 @@ INPUT_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 START_DATE_FILTER = "2019-09-01"
 
-# Targeted queries for the Centre itself
-CENTRE_QUERIES = [
-    '"Leverhulme Centre for Demographic Science"',
-    '"LCDS Oxford"',
-]
-
 # --- HELPERS ---
 def clean_html(text):
     if not text: return ""
     return BeautifulSoup(text, "html.parser").get_text()
 
-# --- ENGINE 1: GOOGLE NEWS (Smart Query) ---
+# --- ENGINE 1: GOOGLE NEWS (Smart Query + Keynotes) ---
 def fetch_google_news(query):
-    # Smart Query: Forces "Oxford" or "LCDS" context for names
-    if "Leverhulme" not in query and "LCDS" not in query: 
-        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Sociology")'
+    # Expanded Smart Query:
+    # 1. Catches "Oxford" context (Media)
+    # 2. Catches "Keynote/Conference" context (Talks)
+    if "Leverhulme" not in query: 
+        smart_query = f'"{query}" AND ("Oxford" OR "LCDS" OR "Demographic" OR "Keynote" OR "Plenary" OR "Conference" OR "Panelist")'
     else:
         smart_query = query
 
     encoded = urllib.parse.quote(smart_query)
+    # We use the generic search RSS (not just news) to catch conference websites if possible
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
     
     try:
@@ -42,17 +39,30 @@ def fetch_google_news(query):
         for entry in feed.entries:
             title = entry.title
             summary = clean_html(getattr(entry, 'summary', ''))
+            link = entry.link
+            
+            # Date Parsing
             try:
                 dt = pd.to_datetime(entry.published).date()
             except:
                 dt = date.today()
 
+            # INTELLIGENT TAGGING
+            # Distinguish between a News Article and a Talk/Keynote
+            text_blob = (title + " " + summary).lower()
+            if any(x in text_blob for x in ["keynote", "plenary", "panelist", "conference presentation", "invited speaker"]):
+                item_type = "Keynote / Talk"
+            elif any(x in text_blob for x in ["study", "research", "paper", "journal", "published"]):
+                item_type = "Media (Research)"
+            else:
+                item_type = "Media Mention"
+
             results.append({
                 "LCDS Mention": title,
                 "Summary": summary[:500],
-                "Link": entry.link,
+                "Link": link,
                 "Date Available Online": dt,
-                "Type": "Media Mention",
+                "Type": item_type,
                 "Source": "Google News",
                 "Name": query
             })
@@ -60,12 +70,11 @@ def fetch_google_news(query):
     except:
         return []
 
-# --- ENGINE 2: CROSSREF EVENT DATA (Free Impact) ---
+# --- ENGINE 2: CROSSREF EVENT DATA (Impact) ---
 def fetch_crossref_events(doi, name):
     if not doi or "doi.org" not in str(doi): return []
     clean_doi = str(doi).split("doi.org/")[-1].strip()
     
-    # We ask for Wikipedia, Newsfeed, Reddit, and Policy (Web)
     url = f"https://api.eventdata.crossref.org/v1/events?obj-id={clean_doi}&rows=5&mailto=admin@lcds.ox.ac.uk"
     
     try:
@@ -104,9 +113,8 @@ def fetch_altmetric_free(doi, name):
         data = r.json()
         events = []
         
-        # Check for News
         if 'news' in data.get('posts', {}):
-            for post in data['posts']['news'][:3]:
+            for post in data['posts']['news'][:2]:
                 events.append({
                     "LCDS Mention": post.get('name', 'News Mention'),
                     "Summary": post.get('summary', 'News tracked by Altmetric'),
@@ -123,14 +131,14 @@ def fetch_altmetric_free(doi, name):
 # --- ENGINE 4: OPENALEX (Discovery Only) ---
 def fetch_openalex_papers(orcid):
     """
-    Fetches papers since Sep 2019 purely for Discovery.
-    Does NOT return a record to be saved, only raw data to be searched.
+    Fetches papers purely to find their DOIs for Impact searching.
+    We do NOT save the papers themselves.
     """
     if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan':
         return []
     
     orcid_id = str(orcid).replace("https://orcid.org/", "").strip()
-    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=20"
+    url = f"https://api.openalex.org/works?filter=author.orcid:https://orcid.org/{orcid_id},from_publication_date:{START_DATE_FILTER}&per-page=15"
     
     raw_papers = []
     try:
@@ -139,8 +147,7 @@ def fetch_openalex_papers(orcid):
         for item in data.get('results', []):
             raw_papers.append({
                 'title': item.get('title'),
-                'doi': item.get('doi'),
-                'id': item.get('id')
+                'doi': item.get('doi')
             })
     except:
         pass
@@ -152,7 +159,7 @@ def process_person(row):
     orcid = row['ORCID']
     person_results = []
     
-    # A. Search Media (Name) - Smart Query
+    # A. Search Media & Keynotes (Smart Query)
     person_results.extend(fetch_google_news(name))
     
     # B. Fetch Papers (Internal Use Only)
@@ -162,17 +169,14 @@ def process_person(row):
         doi = paper.get('doi')
         title = paper.get('title')
         
-        # We DO NOT save the paper itself anymore. 
-        # We only save what we find ABOUT the paper.
-        
         # C. Search Impact (Crossref + Altmetric)
         if doi:
             person_results.extend(fetch_crossref_events(doi, name))
             person_results.extend(fetch_altmetric_free(doi, name))
             
-        # D. Search Media for Paper Title 
-        # (Only for top 3 recent papers to prevent Google blocking)
-        if papers.index(paper) < 3 and title and len(title.split()) > 5:
+        # D. Search Media for Paper Title (Viral Check)
+        # Only top 2 recent papers to prevent blocking
+        if papers.index(paper) < 2 and title and len(title.split()) > 5:
             news_hits = fetch_google_news(f'"{title}"')
             for hit in news_hits:
                 hit['Type'] = "Media (via Paper)"
@@ -183,8 +187,7 @@ def process_person(row):
 
 # --- MAIN ---
 def main():
-    print("--- LCDS Media-Only Tracker (No Raw Pubs) ---")
-    start_time = time.time()
+    print("--- LCDS Media & Keynote Tracker ---")
     
     # 1. Load Data
     try:
@@ -207,18 +210,9 @@ def main():
 
     new_records = []
 
-    # 3. CENTRE NEWS
-    print("Scanning Centre News...")
-    for query in CENTRE_QUERIES:
-        hits = fetch_google_news(query)
-        for h in hits:
-            h['Name'] = "LCDS General"
-            if str(h['Link']) not in existing_links:
-                new_records.append(h)
-                existing_links.add(str(h['Link']))
-
-    # 4. PEOPLE (PARALLEL)
-    print("Scanning People (Parallel)...")
+    # 3. PEOPLE SCAN (No more 'LCDS General' loop)
+    print("Scanning People & Keynotes (Parallel)...")
+    
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_person = {executor.submit(process_person, row): row['Name'] for _, row in df_people.iterrows()}
         
@@ -231,8 +225,8 @@ def main():
                         existing_links.add(str(res['Link']))
             except Exception: pass
 
-    # 5. SAVE
-    print(f"Scan finished. Found {len(new_records)} new media mentions.")
+    # 4. SAVE
+    print(f"Scan finished. Found {len(new_records)} new items.")
     if new_records:
         df_new = pd.DataFrame(new_records)
         df_final = pd.concat([df_existing, df_new], ignore_index=True)

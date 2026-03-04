@@ -14,10 +14,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- DARK MODE OPTIMIZED CSS ---
+# --- CSS: DARK MODE & FOOTER ---
 st.markdown("""
 <style>
-    /* Footer that adapts to Light/Dark mode automatically */
     .footer {
         position: fixed;
         left: 0;
@@ -36,15 +35,8 @@ st.markdown("""
         text-decoration: none;
         font-weight: bold;
     }
-    /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
-    /* Better metrics */
-    div[data-testid="stMetricValue"] {
-        font-size: 26px;
-        font-weight: 600;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -58,7 +50,7 @@ def load_data():
         df['Date Available Online'] = pd.to_datetime(df['Date Available Online'])
         df['Year'] = df['Date Available Online'].dt.year
         
-        # Safety for missing columns
+        # Safety: Fill missing columns
         if "Snippet" not in df.columns and "Summary" in df.columns:
             df["Snippet"] = df["Summary"]
         if "Type" not in df.columns:
@@ -78,36 +70,55 @@ if df.empty:
     st.info("System initializing... Data will appear after the first background run.")
     st.stop()
 
-# 4. SIDEBAR
+# 4. SIDEBAR & FILTERS
 with st.sidebar:
-    st.header("🔍 Filters")
-    time_option = st.radio("Time Range", ["Last Month", "Last Year", "All Time"], index=1)
+    st.header("🔍 Intelligence Filters")
     
+    # A. Time Filter (Crucial Request)
+    time_option = st.radio(
+        "Time Range",
+        ["Last Week", "Last Month", "Last Year", "All Time (Sep 2019+)"],
+        index=3 # Default to All Time
+    )
+    
+    # Calculate Start Date
     today = pd.Timestamp.now()
-    if time_option == "Last Month": start_date = today - timedelta(days=30)
-    elif time_option == "Last Year": start_date = today - timedelta(days=365)
-    else: start_date = pd.Timestamp("2019-09-01")
+    if time_option == "Last Week":
+        start_date = today - timedelta(days=7)
+    elif time_option == "Last Month":
+        start_date = today - timedelta(days=30)
+    elif time_option == "Last Year":
+        start_date = today - timedelta(days=365)
+    else:
+        start_date = pd.Timestamp("2019-09-01")
 
+    # Apply Time Filter Immediately
     df_filtered = df[df['Date Available Online'] >= start_date].copy()
+    
     st.divider()
     
-    # Category & Academic Filters
+    # B. Category & Name Filters
     selected_types = st.multiselect("Content Type", sorted(df_filtered['Type'].unique()))
     selected_names = st.multiselect("Academic", sorted(df_filtered['Name'].unique()))
     
     st.divider()
-    st.download_button("📥 Download Data", df_filtered.to_csv(index=False), "lcds_impact.csv")
+    
+    # C. Download
+    st.download_button(
+        label="📥 Download View (CSV)", 
+        data=df_filtered.to_csv(index=False).encode('utf-8'),
+        file_name=f"lcds_impact_{time_option.replace(' ', '_').lower()}.csv",
+        mime="text/csv"
+    )
 
-# 5. SEARCH & FILTER LOGIC
-search_query = st.text_input("🔎 Search (Names, Topics, Venues)", placeholder="Try 'Melinda', 'Pension', or 'Keynote'...")
+# 5. GLOBAL SEARCH
+search_query = st.text_input("🔎 Search (e.g., 'Fertility', 'Keynote', 'BBC')", "")
 
-# Apply Sidebar Filters
+# Apply Sidebar & Search Filters
 if selected_types: df_filtered = df_filtered[df_filtered['Type'].isin(selected_types)]
 if selected_names: df_filtered = df_filtered[df_filtered['Name'].isin(selected_names)]
 
-# Apply Search Bar (Search ALL text columns)
 if search_query:
-    # We search Name, Title, and Snippet columns
     mask = (
         df_filtered['Name'].str.contains(search_query, case=False, na=False) |
         df_filtered['LCDS Mention'].str.contains(search_query, case=False, na=False) |
@@ -115,24 +126,24 @@ if search_query:
     )
     df_filtered = df_filtered[mask]
 
-# 6. METRICS & CHARTS
+# 6. METRICS
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total Mentions", len(df_filtered))
-c2.metric("People Mentioned", df_filtered['Name'].nunique())
-c3.metric("Keynotes", len(df_filtered[df_filtered['Type'].str.contains("Keynote", na=False)]))
+c2.metric("Academics", df_filtered['Name'].nunique())
+c3.metric("Keynotes", len(df_filtered[df_filtered['Type'].str.contains("Conference|Keynote", na=False)]))
 c4.metric("Sources", df_filtered['Source'].nunique())
 
 st.divider()
 
 # 7. MAIN TABLE
-st.subheader("Latest Mentions")
+st.subheader(f"Mentions ({time_option})")
 st.dataframe(
     df_filtered[[
         "Type", "Name", "LCDS Mention", "Snippet", "Link", "Date Available Online"
     ]],
     column_config={
         "Link": st.column_config.LinkColumn("Action", display_text="View Here"),
-        "Snippet": st.column_config.TextColumn("Context", width="large", help="Snippet from article"),
+        "Snippet": st.column_config.TextColumn("Context", width="large"),
         "LCDS Mention": st.column_config.TextColumn("Title", width="medium"),
         "Date Available Online": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
         "Type": st.column_config.TextColumn("Category", width="small"),
@@ -143,10 +154,10 @@ st.dataframe(
 
 st.divider()
 
-# 8. ANALYTICS (Charts)
+# 8. ANALYTICS
 col1, col2 = st.columns(2)
 with col1:
-    st.markdown("**Share of Voice**")
+    st.markdown("#### Share of Voice")
     if not df_filtered.empty:
         top = df_filtered['Name'].value_counts().reset_index().head(10)
         top.columns = ['Name', 'Count']
@@ -154,17 +165,17 @@ with col1:
         st.plotly_chart(fig, use_container_width=True)
 
 with col2:
-    st.markdown("**Content Type Breakdown**")
+    st.markdown("#### Media vs. Impact")
     if not df_filtered.empty:
         types = df_filtered['Type'].value_counts().reset_index()
         types.columns = ['Type', 'Count']
         fig2 = px.bar(types, x='Count', y='Type', orientation='h', color='Count')
         st.plotly_chart(fig2, use_container_width=True)
 
-# 9. FOOTER (Dark Mode Compatible)
+# 9. FOOTER
 st.markdown("""
 <div class="footer">
-    © University of Oxford 2026. All rights reserved. 
+    &copy; University of Oxford 2026. All rights reserved. 
     <a href="https://www.demography.ox.ac.uk" target="_blank">demography.ox.ac.uk</a>
 </div>
 """, unsafe_allow_html=True)

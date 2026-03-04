@@ -16,8 +16,7 @@ OUTPUT_FILE = "lcds_media_tracker.csv"
 # Time Limit: Look back 1 year
 START_DATE = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 
-# 1. STRICT CONTEXT (Must appear in the article text)
-# We use regex word boundaries (\b) to avoid partial matches
+# 1. STRICT CONTEXT (Must appear in the article text for Name matches)
 CONTEXT_KEYWORDS = [
     r"university of oxford", r"oxford university", 
     r"leverhulme centre", r"lcds", 
@@ -26,10 +25,11 @@ CONTEXT_KEYWORDS = [
 ]
 
 # 2. JUNK PATTERNS (Instant Reject)
-# Blocks shopping items, obituaries, sports, and generic lists
-JUNK_REGEX = re.compile(r"\b(obituary|funeral|death notice|dignity memorial|passed away|survived by|class of \d{4}|high school|football|basketball|microfibre|waterproof|drawstring|bag case|glass organiser|hammock)\b", re.IGNORECASE)
+# Blocks shopping items, obituaries, and generic "Oxford" noise
+JUNK_REGEX = re.compile(r"\b(obituary|funeral|death notice|dignity memorial|passed away|survived by|class of \d{4}|high school|football|basketball|microfibre|waterproof|drawstring|bag case|glass organiser|hammock|pub|coin|royal mint)\b", re.IGNORECASE)
 
-# 3. ACADEMIC & JUNK DOMAINS (Blocklist)
+# 3. ACADEMIC & PUBLISHER BLOCKLIST
+# We want media coverage OF the paper, not the paper itself.
 BLOCK_DOMAINS = [
     "doi.org", "sciencedirect.com", "wiley.com", "springer.com", 
     "tandfonline.com", "sagepub.com", "oup.com", "cambridge.org", 
@@ -57,42 +57,24 @@ def is_blocked_domain(url):
 # --- NLP LAYER: CONTENT VERIFICATION ---
 def verify_content_relevance(url, name):
     """
-    NLP LAYER: Fetches the article and checks if the academic is actually mentioned 
-    in a relevant context. This filters out "Oxford Cloth" products and random name matches.
+    NLP LAYER: Visits the link to verify the person or topic is actually there.
     """
     try:
-        # Fast timeout (5s) to avoid hanging on slow sites
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LCDS-Bot/1.0'}
         r = requests.get(url, timeout=5, headers=headers)
-        if r.status_code != 200: 
-            return False # If we can't read it, we assume it's risky/low-quality
+        if r.status_code != 200: return False 
         
-        # Parse Text
         soup = BeautifulSoup(r.content, 'html.parser')
-        # Kill scripts and styles
-        for script in soup(["script", "style", "nav", "footer"]):
-            script.decompose()
-        
+        for s in soup(["script", "style", "nav", "footer"]): s.decompose()
         text = soup.get_text().lower()
         
-        # CHECK 1: Is the name there?
-        if name.lower() not in text:
-            return False
-            
-        # CHECK 2: Is there a Context Keyword? (Oxford, LCDS, Demography)
-        # This kills "David Kirk (Basketball)" because his page won't say "Demography"
-        has_context = False
-        for pattern in CONTEXT_KEYWORDS:
-            if re.search(pattern, text):
-                has_context = True
-                break
-        
-        return has_context
-
-    except:
-        # If fetch fails (paywall/timeout), we fall back to trusting the snippet 
-        # ONLY if the snippet was very strong. For now, strict fail.
+        # Check if Name OR Context is present
+        if name.lower() in text:
+            # If name is found, ensure it's not a false positive by checking context
+            for pattern in CONTEXT_KEYWORDS:
+                if re.search(pattern, text): return True
         return False
+    except: return False # Fail safe
 
 # --- VALIDATION ENGINE ---
 def validate_hit(entry, name, paper_titles):
@@ -102,32 +84,26 @@ def validate_hit(entry, name, paper_titles):
     link = entry.link
     
     # 1. Regex Junk Filter (Fast)
-    if JUNK_REGEX.search(content_blob): 
-        return False
+    if JUNK_REGEX.search(content_blob): return False
     
     # 2. Domain Block (Fast)
-    if is_blocked_domain(link): 
-        return False
+    if is_blocked_domain(link): return False
     
-    # 3. Paper Title Match (High Trust)
-    # If the snippet mentions a known paper, we trust it without fetching
+    # 3. Paper Title Match (High Priority - Captures "Nameless" Study Mentions)
     if paper_titles:
         for p_title in paper_titles:
+            # Only match specific titles > 20 chars to avoid generic noise
             if p_title and len(p_title) > 20 and p_title.lower() in content_blob:
                 return True
 
-    # 4. Strict Context on Snippet (Medium Trust)
-    # If snippet already has "Name" AND "Oxford", we trust it.
+    # 4. Name + Context Match
     has_name = name.lower() in content_blob
     has_context = any(re.search(pat, content_blob) for pat in CONTEXT_KEYWORDS)
     
-    if has_name and has_context:
-        return True
+    if has_name and has_context: return True
         
-    # 5. NLP Deep Scan (Slow / Deep Verification)
-    # If snippet is vague, we go to the page and read it.
-    if has_name: # Only check links where name at least appears
-        return verify_content_relevance(link, name)
+    # 5. NLP Deep Scan (If unsure)
+    if has_name: return verify_content_relevance(link, name)
 
     return False
 
@@ -135,7 +111,8 @@ def validate_hit(entry, name, paper_titles):
 def fetch_papers_crossref(orcid):
     if pd.isna(orcid) or str(orcid).strip() == "" or str(orcid).lower() == 'nan': return []
     oid = str(orcid).replace("https://orcid.org/", "").strip()
-    url = f"https://api.crossref.org/works?filter=orcid:{oid},from-pub-date:{START_DATE}&rows=15"
+    # Fetch papers from last 1 year
+    url = f"https://api.crossref.org/works?filter=orcid:{oid},from-pub-date:{START_DATE}&rows=10"
     try:
         r = requests.get(url, timeout=10)
         items = r.json().get('message', {}).get('items', [])
@@ -143,14 +120,13 @@ def fetch_papers_crossref(orcid):
     except: return []
 
 def fetch_google_news(name, paper_titles):
-    # Search Query: Name + Context OR Paper Title
-    # We use a broad search first, then filter strictly with Python
+    # Strategy A: Person + Context
     q_context = f'"{name}" AND ("Oxford" OR "LCDS" OR "Nuffield" OR "Leverhulme") after:{START_DATE}'
-    
     queries = [q_context]
+    
+    # Strategy B: Paper Titles (Captures "Study published in..." mentions)
     if paper_titles:
-        # Check top 3 recent papers
-        for p in paper_titles[:3]:
+        for p in paper_titles[:3]: # Check top 3 recent papers
             safe_title = p['title'].replace(":", "").replace("-", " ")
             queries.append(f'"{safe_title}" after:{START_DATE}')
             
@@ -165,14 +141,15 @@ def fetch_google_news(name, paper_titles):
             for entry in feed.entries:
                 if entry.link in seen_links: continue
                 
-                # --- RUN VALIDATION ---
                 if validate_hit(entry, name, [p['title'] for p in paper_titles]):
-                    
-                    # Tagging
+                    # Auto-Tagging
                     full_text = (entry.title + " " + extract_snippet(entry)).lower()
-                    if "keynote" in full_text or "conference" in full_text: tag = "Conference / Talk"
-                    elif "study" in full_text or "research" in full_text: tag = "Media (Research)"
-                    else: tag = "Media Mention"
+                    if any(x in full_text for x in ["keynote", "plenary", "conference", "panel", "talk"]): 
+                        tag = "Conference / Talk"
+                    elif any(x in full_text for x in ["study", "research", "paper", "journal", "published"]): 
+                        tag = "Media (Research)"
+                    else: 
+                        tag = "Media Mention"
 
                     results.append({
                         "LCDS Mention": entry.title,
@@ -189,13 +166,11 @@ def fetch_google_news(name, paper_titles):
 
 # --- MAIN ---
 def process_person(row):
-    # 1. Get recent papers (Crossref)
     papers = fetch_papers_crossref(row['ORCID'])
-    # 2. Search Media (Google News with NLP filter)
     return fetch_google_news(row['Name'], papers)
 
 def main():
-    print("--- LCDS Smart NLP Tracker (Deep Scan) ---")
+    print("--- LCDS Smart Tracker (Regex + NLP + Article Search) ---")
     
     try:
         df_p = pd.read_csv(INPUT_FILE, encoding='latin1')
@@ -203,19 +178,17 @@ def main():
         print(f"Loaded {len(df_p)} profiles.")
     except Exception as e: print(e); return
 
-    # Load & CLEAN existing DB
+    # LOAD & CLEAN EXISTING DB
     if os.path.exists(OUTPUT_FILE):
         try:
             df_ex = pd.read_csv(OUTPUT_FILE)
-            # NUKE THE JUNK: Remove LCDS General and Shopping items
-            clean_mask = (
-                (df_ex['Name'] != "LCDS General") & 
-                (~df_ex['LCDS Mention'].str.contains("Microfibre|Hammock|Bag|Glass", case=False, na=False)) &
-                (~df_ex['Link'].str.contains("nature.com|amazon|ebay", case=False, na=False))
-            )
-            df_ex = df_ex[clean_mask]
+            # Run the Junk Regex on existing data to purge old bad hits
+            df_ex = df_ex[~df_ex['LCDS Mention'].astype(str).str.contains(JUNK_REGEX)]
+            # Run the Domain Blocklist on existing data
+            df_ex = df_ex[~df_ex['Link'].astype(str).str.contains('|'.join(BLOCK_DOMAINS), case=False)]
+            
             existing_links = set(df_ex['Link'].astype(str))
-            print(f"Cleaned database. Kept {len(df_ex)} valid records.")
+            print(f"Cleaned DB. Kept {len(df_ex)} valid records.")
         except: 
             df_ex = pd.DataFrame()
             existing_links = set()
@@ -224,9 +197,8 @@ def main():
         existing_links = set()
 
     new_records = []
-    print("Scanning (This may take longer due to content verification)...")
+    print("Scanning (Parallel)...")
     
-    # 20 Workers to handle the extra network load of NLP verification
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(process_person, r): r['Name'] for _, r in df_p.iterrows()}
         for f in as_completed(futures):
@@ -243,7 +215,6 @@ def main():
         df_final = pd.concat([df_ex, df_new], ignore_index=True)
         df_final.drop_duplicates(subset=['Link'], inplace=True)
         
-        # Date sorting
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
         df_final.sort_values(by='Date Available Online', ascending=False, inplace=True)
         df_final['Date Available Online'] = df_final['Date Available Online'].dt.date
@@ -251,10 +222,9 @@ def main():
         df_final.to_csv(OUTPUT_FILE, index=False)
         print(f"Success. Added {len(new_records)} verified items.")
     else:
-        # Save the cleaned version even if no new records found
         if not df_ex.empty:
             df_ex.to_csv(OUTPUT_FILE, index=False)
-            print("No new items, but junk was cleaned from existing file.")
+            print("No new items, but cleaned existing file.")
         else:
             print("No data.")
 

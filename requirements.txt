@@ -3,7 +3,5 @@ feedparser
 requests
 beautifulsoup4
 ddgs
-lxml
-openpyxl
 plotly
 streamlit

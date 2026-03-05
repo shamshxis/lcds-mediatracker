@@ -5,35 +5,33 @@ import urllib.parse
 import time
 import logging
 import sys
-import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
 # --- IMPORT DDGS SAFELY ---
 try:
-    from ddgs import DDGS 
+    from ddgs import DDGS
 except ImportError:
-    # Fallback in case of package mismatch
+    # Handle case where user installed the old 'duckduckgo_search' package
     try:
         from duckduckgo_search import DDGS
-    except:
+    except ImportError:
         DDGS = None
 
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/4.0 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/6.0 (mailto:admin@lcds.ox.ac.uk)"
 
-# DOMAIN ALLOWLIST FOR GDELT (To reduce noise)
-# We accept these domains OR anything ending in .ac.uk / .edu
+# DOMAIN ALLOWLIST FOR GDELT
 TRUSTED_DOMAINS = [
     "bbc.co.uk", "bbc.com", "ft.com", "theguardian.com", "telegraph.co.uk",
     "timeshighereducation.com", "economist.com", "reuters.com", "bloomberg.com",
-    "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk", "science.org", "nature.com"
+    "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk", "science.org", "nature.com",
+    "washingtonpost.com", "nytimes.com", "forbes.com", "weforum.org", "abc.net.au"
 ]
 
-# GDELT QUERY LOGIC
-# "Keyword1" near10 "Keyword2"
+# GDELT QUERIES
 GDELT_QUERIES = [
     '"Leverhulme Centre" near10 "Demographic"',
     '"LCDS" near10 "Oxford"',
@@ -66,34 +64,27 @@ def clean_html(text):
 
 def verify_affiliation(text, name=""):
     """
-    Checks if text contains LCDS context. 
-    If 'name' is provided, ensures name is also present.
+    Checks if text contains LCDS context.
     """
     text_lower = text.lower()
-    
-    # Context Keywords
     affiliations = ["oxford", "leverhulme", "lcds", "nuffield", "demographic", "population", "sociology"]
     
-    # 1. If name is provided, it MUST be there
     if name and name.lower() not in text_lower:
         return False
         
-    # 2. Check for at least one affiliation context
     has_aff = any(a in text_lower for a in affiliations)
     
-    # 3. Special case for Melinda Mills (Groningen)
     if name and "melinda mills" in name.lower() and "groningen" in text_lower:
         has_aff = True
 
     return has_aff
 
 def load_orcid_file(filepath):
-    # Try multiple encodings
     for enc in ['utf-8', 'latin1', 'cp1252']:
         try:
             return pd.read_csv(filepath, encoding=enc)
         except: continue
-    return pd.DataFrame() # Return empty if fails
+    return pd.DataFrame() 
 
 # --- DATA FETCHERS ---
 
@@ -110,7 +101,47 @@ def fetch_crossref_titles(orcid):
     except: pass
     return []
 
-def search_google_rss(query, mode="Name", academic_name=None):
+def search_ddg_deep(name):
+    """
+    DuckDuckGo Search (Restored & Safe-Guarded).
+    Uses backend='html' to avoid the Wikipedia API crash.
+    """
+    if DDGS is None:
+        return []
+
+    hits = []
+    # Query for Prestige Events
+    query = f'"{name}" (keynote OR plenary OR award OR prize) demography'
+    
+    try:
+        with DDGS() as ddgs:
+            # backend='html' bypasses the unstable 'api'/'instant answer' endpoints
+            results = ddgs.text(query, region='wt-wt', safesearch='off', backend='html', max_results=5)
+            
+            for r in results:
+                title = r.get('title', '')
+                link = r.get('href', '')
+                snippet = r.get('body', '')
+                
+                # Verify Context
+                if verify_affiliation(title + " " + snippet, name):
+                    hits.append({
+                        "LCDS Mention": title,
+                        "Link": link,
+                        "Date Available Online": datetime.now().strftime('%Y-%m-%d'), # DDG doesn't give precise dates
+                        "Type": "Talk/Award",
+                        "Source": "DuckDuckGo",
+                        "Name": name,
+                        "Snippet": snippet[:400]
+                    })
+                time.sleep(0.5) 
+    except Exception as e:
+        # ⚠️ Log error but DO NOT CRASH the script
+        logging.warning(f"DDG Search skipped for {name} due to error: {e}")
+        
+    return hits
+
+def search_google_rss(query, mode="Name", academic_name=None, entry_type="Media Mention"):
     """Standard RSS Search"""
     encoded = urllib.parse.quote(query)
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
@@ -126,76 +157,29 @@ def search_google_rss(query, mode="Name", academic_name=None):
             if mode == "Name":
                 if verify_affiliation(full_text, academic_name): valid = True
             else: 
-                valid = True # Trust Pub title matches
+                valid = True 
             
             if valid:
                 hits.append({
                     "LCDS Mention": title,
                     "Link": entry.link,
                     "Date Available Online": normalize_date(entry.published),
-                    "Type": "Media Mention",
+                    "Type": entry_type,
                     "Source": entry.source.get('title', 'Google News'),
                     "Name": academic_name,
-                    "Snippet": summary[:300]
+                    "Snippet": summary[:400]
                 })
-    except Exception as e:
-        logging.error(f"RSS Error: {e}")
-    return hits
-
-def search_deep_events_safe(name):
-    """
-    DDGS Search with Error Handling (Fixes Wikipedia Crash).
-    """
-    if DDGS is None: return []
-    
-    hits = []
-    query = f'"{name}" (keynote OR plenary OR award OR prize) demography'
-    
-    try:
-        with DDGS() as ddgs:
-            # We catch specific errors inside the generator loop if possible, 
-            # but DDGS often throws them at the start.
-            results = list(ddgs.text(query, region='wt-wt', safesearch='off', timelimit='y', max_results=5))
-            
-            for r in results:
-                title = r.get('title', '')
-                link = r.get('href', '')
-                snippet = r.get('body', '')
-                
-                if verify_affiliation(title + " " + snippet, name):
-                    hits.append({
-                        "LCDS Mention": title,
-                        "Link": link,
-                        "Date Available Online": datetime.now().strftime('%Y-%m-%d'),
-                        "Type": "Talk/Award",
-                        "Source": "Web Search",
-                        "Name": name,
-                        "Snippet": snippet[:300]
-                    })
-                time.sleep(1)
-    except Exception as e:
-        # ⚠️ This is where we catch the "Wikipedia" / DNS error silently
-        logging.warning(f"Skipping deep search for {name} due to connection error: {e}")
-        
+    except: pass
     return hits
 
 def fetch_gdelt_impact():
-    """
-    GDELT 2.0 Doc API - Captures Global News & Transcripts.
-    Filters: near10 context + Trusted Domains.
-    """
+    """GDELT 2.0 Doc API"""
     print("  Running GDELT Global Scan...")
     hits = []
     base_url = "https://api.gdeltproject.org/api/v2/doc/doc"
     
     for q in GDELT_QUERIES:
-        params = {
-            "query": q,
-            "mode": "artlist",
-            "maxrecords": "50",
-            "timespan": "6m",
-            "format": "json"
-        }
+        params = {"query": q, "mode": "artlist", "maxrecords": "30", "timespan": "6m", "format": "json"}
         try:
             r = requests.get(base_url, params=params, timeout=15)
             if r.status_code == 200:
@@ -205,14 +189,9 @@ def fetch_gdelt_impact():
                     url = article.get('url', '')
                     domain = article.get('domain', '').lower()
                     
-                    # DOMAIN FILTER
-                    is_trusted = any(d in domain for d in TRUSTED_DOMAINS) or domain.endswith(".edu") or domain.endswith(".ac.uk")
-                    
-                    if is_trusted:
-                        # Parse GDELT Date (YYYYMMDDTHHMMSS)
+                    if any(d in domain for d in TRUSTED_DOMAINS) or domain.endswith((".edu", ".ac.uk")):
                         raw_date = article.get('seendate', '')
                         fmt_date = datetime.strptime(raw_date, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%d") if raw_date else None
-                        
                         hits.append({
                             "LCDS Mention": title,
                             "Link": url,
@@ -223,15 +202,14 @@ def fetch_gdelt_impact():
                             "Snippet": f"Sourced via GDELT (Domain: {domain})"
                         })
             time.sleep(1)
-        except Exception as e:
-            logging.error(f"GDELT Error for {q}: {e}")
+        except: pass
             
     return hits
 
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v4.0 (GDELT + SafeMode) ---")
+    print("--- LCDS Tracker v6.0 (DDGS + GDELT) ---")
     
     df_orcid = load_orcid_file(INPUT_ORCID_FILE)
     if 'Name' not in df_orcid.columns: 
@@ -259,30 +237,30 @@ def main():
         # A. Crossref Seed -> News
         titles = fetch_crossref_titles(orcid)
         for t in titles:
-            hits = search_google_rss(f'"{t}"', mode="Pub", academic_name=name)
+            hits = search_google_rss(f'"{t}"', mode="Pub", academic_name=name, entry_type="Research Coverage")
             for h in hits:
                 if h['Link'] not in existing_links:
                     all_data.append(h)
                     existing_links.add(h['Link'])
             time.sleep(0.5)
 
-        # B. Direct Name Search
-        hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name)
-        for h in hits:
-            if h['Link'] not in existing_links:
-                all_data.append(h)
-                existing_links.add(h['Link'])
-
-        # C. Deep Events (Protected)
-        hits = search_deep_events_safe(name)
+        # B. Direct Name Search (Media)
+        hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name, entry_type="Media Mention")
         for h in hits:
             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
         
+        # C. Deep Events (DuckDuckGo Restored)
+        ddg_hits = search_ddg_deep(name)
+        for h in ddg_hits:
+            if h['Link'] not in existing_links:
+                all_data.append(h)
+                existing_links.add(h['Link'])
+
         time.sleep(1)
 
-    # 2. PROCESS GDELT (GLOBAL LAYER)
+    # 2. PROCESS GDELT
     gdelt_hits = fetch_gdelt_impact()
     for h in gdelt_hits:
         if h['Link'] not in existing_links:
@@ -292,11 +270,9 @@ def main():
     # 3. SAVE
     df_final = pd.DataFrame(all_data)
     if not df_final.empty:
-        # Convert date safely
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
         s_date, e_date = get_date_window()
         
-        # Filter Window
         df_final = df_final[
             (df_final['Date Available Online'] >= s_date) & 
             (df_final['Date Available Online'] <= e_date)

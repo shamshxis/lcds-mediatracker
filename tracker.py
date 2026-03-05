@@ -5,10 +5,17 @@ import urllib.parse
 import time
 import logging
 import sys
-import random
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from duckduckgo_search import DDGS  # New library for deep search
+
+# --- UPDATED IMPORT ---
+try:
+    from ddgs import DDGS 
+except ImportError:
+    # Fallback if user installed the old package by mistake
+    from duckduckgo_search import DDGS
+
+# ... rest of the script remains exactly the same ...
 
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"

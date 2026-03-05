@@ -6,11 +6,12 @@ import time
 import re
 from datetime import datetime, timedelta
 import logging
+import sys
 
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/2.0 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/2.1 (mailto:admin@lcds.ox.ac.uk)"
 
 # Affiliations to Verify (Lowercase for matching)
 AFFILIATIONS = [
@@ -43,13 +44,33 @@ def normalize_date(date_str):
     except:
         return None
 
+def load_orcid_file(filepath):
+    """Robust file loader that handles different encodings (UTF-8, Latin-1, etc)."""
+    encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'ISO-8859-1']
+    
+    for encoding in encodings_to_try:
+        try:
+            return pd.read_csv(filepath, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except FileNotFoundError:
+            logging.error(f"File not found: {filepath}")
+            sys.exit(1)
+            
+    # If all fail, try forcing it with python engine
+    try:
+        return pd.read_csv(filepath, encoding='utf-8', errors='replace')
+    except Exception as e:
+        logging.error(f"CRITICAL: Could not read {filepath}. Please save it as standard CSV (UTF-8). Error: {e}")
+        sys.exit(1)
+
 def verify_affiliation(text, name):
     """
     NLP-lite: Checks if the text contains the academic's name AND a valid affiliation.
     """
     text_lower = text.lower()
     
-    # 1. Check strict name match (to avoid partial matches like 'Jen' for 'Jennifer')
+    # 1. Check strict name match
     if name.lower() not in text_lower:
         return False
         
@@ -87,8 +108,7 @@ def fetch_crossref_pubs(orcid):
             pubs = []
             for item in items:
                 title = item.get('title', [''])[0]
-                # Clean title (remove newlines, extra spaces)
-                title = " ".join(title.split())
+                title = " ".join(title.split()) # Clean whitespace
                 if title:
                     pubs.append({
                         "Title": title,
@@ -120,13 +140,9 @@ def search_media(query, mode="Name", academic_name=None):
             title = entry.title
             link = entry.link
             pub_date = normalize_date(entry.published)
-            
-            # Combine title and description for context checking
-            # Feedparser puts the description in 'summary' usually
             summary = getattr(entry, 'summary', '')
             full_text = f"{title} {summary}"
             
-            # FILTERS
             is_match = False
             
             if mode == "Name":
@@ -134,9 +150,8 @@ def search_media(query, mode="Name", academic_name=None):
                 if verify_affiliation(full_text, academic_name):
                     is_match = True
             elif mode == "Pub":
-                # If searching by Title, we assume the result is relevant if it matches the title query
-                # (Google News does the matching, we just trust it matches the title)
-                if len(title) > 10: # Avoid noise from short titles
+                # If searching by Title, assume relevant if title matches
+                if len(title) > 10: 
                     is_match = True
 
             if is_match:
@@ -148,7 +163,7 @@ def search_media(query, mode="Name", academic_name=None):
                     "Type": "Media Mention" if mode == "Name" else "Pub Reference",
                     "Source": entry.source.get('title', 'Google News'),
                     "Name": academic_name,
-                    "Snippet": full_text[:500] # Save snippet for context
+                    "Snippet": full_text[:500]
                 })
         
         return hits
@@ -157,24 +172,19 @@ def search_media(query, mode="Name", academic_name=None):
         return []
 
 def main():
-    print("--- Starting LCDS Media Tracker v2.0 ---")
+    print("--- Starting LCDS Media Tracker v2.1 (Encoding Fix) ---")
     
-    # 1. LOAD ACADEMICS
-    try:
-        df_orcid = pd.read_csv(INPUT_ORCID_FILE)
-        # Ensure we have Name and ORCID columns. Adjust if your CSV headers differ.
-        if 'Name' not in df_orcid.columns: 
-            # Fallback if 'Name' isn't there but maybe 'First' and 'Last' are?
-            # For now assume 'Name' exists as per your previous script.
-            logging.error("Input CSV must have a 'Name' column.")
-            return
-    except FileNotFoundError:
-        logging.error(f"Could not find {INPUT_ORCID_FILE}. Please ensure it exists.")
+    # 1. LOAD ACADEMICS (With robust encoding check)
+    df_orcid = load_orcid_file(INPUT_ORCID_FILE)
+    
+    # Validate columns
+    if 'Name' not in df_orcid.columns:
+        logging.error(f"Input CSV is missing the 'Name' column. Found: {df_orcid.columns.tolist()}")
         return
 
     all_results = []
     
-    # 2. LOAD EXISTING DATA (To prevent deletion)
+    # 2. LOAD EXISTING DATA
     try:
         df_existing = pd.read_csv(OUTPUT_FILE)
         existing_links = set(df_existing['Link'].astype(str))
@@ -189,17 +199,16 @@ def main():
     
     for idx, row in df_orcid.iterrows():
         name = row['Name']
-        orcid = row.get('ORCID', row.get('orcid')) # Handle case sensitivity
+        # Handle different column names for ORCID (case insensitive)
+        orcid_col = next((c for c in df_orcid.columns if c.lower() == 'orcid'), None)
+        orcid = row[orcid_col] if orcid_col else None
         
         print(f"[{idx+1}/{total_people}] Processing: {name}...")
         
         # A. FETCH PUBLICATIONS (CROSSREF)
         pubs = fetch_crossref_pubs(orcid)
         for p in pubs:
-            # Add Publication itself to the tracker? 
-            # The user asked to "fill the table with... data only". 
-            # Usually we track *mentions* of pubs, but listing the pub itself is good for the "Publication-First" view.
-            # We'll add it as a "Publication" type.
+            # Add Publication to tracker
             pub_entry = {
                 "LCDS Mention": p['Title'],
                 "Summary": f"DOI: {p['DOI']}",
@@ -210,20 +219,18 @@ def main():
                 "Name": name,
                 "Snippet": f"New publication detected: {p['Title']}"
             }
-            # Check for dupes
             if pub_entry['Link'] not in existing_links:
                 all_results.append(pub_entry)
                 existing_links.add(pub_entry['Link'])
 
-            # B. SEARCH MEDIA FOR THIS PUBLICATION TITLE
-            # Only search if title is long enough to be unique (e.g. > 20 chars)
+            # B. SEARCH MEDIA FOR THIS PUBLICATION
             if len(p['Title']) > 20:
                 media_hits = search_media(f'"{p["Title"]}"', mode="Pub", academic_name=name)
                 for m in media_hits:
                     if m['Link'] not in existing_links:
                         all_results.append(m)
                         existing_links.add(m['Link'])
-                time.sleep(1) # Polite delay
+                time.sleep(1) 
 
         # C. SEARCH MEDIA FOR ACADEMIC NAME (STRICT AFFILIATION)
         name_hits = search_media(f'"{name}"', mode="Name", academic_name=name)
@@ -232,7 +239,7 @@ def main():
                 all_results.append(m)
                 existing_links.add(m['Link'])
         
-        time.sleep(1) # Polite delay between people
+        time.sleep(1) # Polite delay
 
     # 4. MERGE & SAVE
     if all_results:
@@ -241,23 +248,22 @@ def main():
     else:
         df_final = df_existing
 
-    # 5. DATE FILTERING (Last 6 Months & Next 6 Months)
-    # Convert date to datetime
-    df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
-    
-    start_date, end_date = get_date_window()
-    # Filter
-    mask = (df_final['Date Available Online'] >= pd.to_datetime(start_date)) & \
-           (df_final['Date Available Online'] <= pd.to_datetime(end_date))
-    
-    df_final_filtered = df_final.loc[mask].copy()
-    
-    # Sort
-    df_final_filtered.sort_values(by='Date Available Online', ascending=False, inplace=True)
-    
-    # Save
-    df_final_filtered.to_csv(OUTPUT_FILE, index=False)
-    print(f"Done! Saved {len(df_final_filtered)} records to {OUTPUT_FILE} (Filtered to ±6 months).")
+    # 5. FILTER & EXPORT
+    if not df_final.empty:
+        # Date cleaning
+        df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
+        
+        start_date, end_date = get_date_window()
+        mask = (df_final['Date Available Online'] >= pd.to_datetime(start_date)) & \
+               (df_final['Date Available Online'] <= pd.to_datetime(end_date))
+        
+        df_final_filtered = df_final.loc[mask].copy()
+        df_final_filtered.sort_values(by='Date Available Online', ascending=False, inplace=True)
+        
+        df_final_filtered.to_csv(OUTPUT_FILE, index=False)
+        print(f"Done! Saved {len(df_final_filtered)} records to {OUTPUT_FILE} (Filtered to ±6 months).")
+    else:
+        print("No data to save.")
 
 if __name__ == "__main__":
     main()

@@ -58,10 +58,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- LOAD DATA (FAIL-SAFE) ---
-# We use a shorter TTL (Time To Live) so it auto-refreshes every 60 seconds
+# --- 1. GET FILE TIMESTAMP (CACHE BUSTER) ---
+def get_file_timestamp():
+    """Reads the actual modification time from the file system."""
+    if not os.path.exists(FILE_PATH):
+        return 0
+    return os.path.getmtime(FILE_PATH)
+
+# --- 2. LOAD DATA (DEPENDS ON TIMESTAMP) ---
+# We pass 'timestamp' here. If the file updates, timestamp changes, forcing a reload.
 @st.cache_data(ttl=60)
-def load_data():
+def load_data(timestamp_key):
     if not os.path.exists(FILE_PATH):
         return None
     try:
@@ -77,19 +84,28 @@ def load_data():
     except Exception:
         return pd.DataFrame()
 
+# --- INITIALIZATION ---
+# Get the real timestamp from disk
+current_ts = get_file_timestamp()
+# Load data using that timestamp as the key
+df = load_data(current_ts)
+
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
     st.header("⚙️ Controls")
     
-    # THE FIX: Manual Refresh Button
-    if st.button("🔄 Refresh Data"):
-        st.cache_data.clear() # Wipes the memory
-        st.rerun()            # Reloads the app
+    if st.button("🔄 Check for New Data"):
+        st.cache_data.clear()
+        st.rerun()
     
+    # Show the user exactly how old the file is
+    if current_ts > 0:
+        readable_time = datetime.fromtimestamp(current_ts).strftime('%Y-%m-%d %H:%M:%S')
+        st.caption(f"📂 File Last Modified:\n{readable_time}")
+    else:
+        st.caption("📂 File Status: Missing")
+        
     st.divider()
-
-# --- DATA LOADING ---
-df = load_data()
 
 # --- CASE 1: FILE IS MISSING (First Run) ---
 if df is None:
@@ -117,18 +133,6 @@ with st.sidebar:
         selected_type = "All"
         
     st.divider()
-    
-    # DOWNLOAD BUTTON LOGIC
-    # We define it here but populate data after filtering below
-    download_placeholder = st.empty()
-    
-    # Get the file timestamp to show true "Last Updated"
-    try:
-        last_mod_time = datetime.fromtimestamp(os.path.getmtime(FILE_PATH)).strftime('%Y-%m-%d %H:%M')
-    except:
-        last_mod_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-        
-    st.caption(f"Data Last Updated: {last_mod_time}")
 
 # --- FILTERING ---
 filtered_df = df.copy()
@@ -212,7 +216,7 @@ st.dataframe(
 # --- FOOTER INJECTION ---
 st.markdown("""
 <div class="footer" align="center">
-        © 2026 Leverhulme Centre for Demographic Science</b> | University of Oxford <br>
+        © 2026 Leverhulme Centre for Demographic Science | University of Oxford <br>
         <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> | 
 </div>
 """, unsafe_allow_html=True)

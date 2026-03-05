@@ -22,15 +22,25 @@ except ImportError:
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/7.0 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/8.0 (mailto:admin@lcds.ox.ac.uk)"
 
-# DOMAIN ALLOWLIST
-TRUSTED_DOMAINS = [
+# 1. BLOCKLIST: EXCLUDE DIRECT ACADEMIC JOURNALS
+# We want news ABOUT papers, not the papers themselves.
+ACADEMIC_BLOCKLIST = [
+    "nature.com", "science.org", "sciencedirect.com", "wiley.com", 
+    "springer.com", "tandfonline.com", "sagepub.com", "frontiersin.org",
+    "plos.org", "mdpi.com", "academic.oup.com", "cambridge.org", 
+    "jstor.org", "ncbi.nlm.nih.gov", "researchgate.net", "academia.edu"
+]
+
+# 2. ALLOWLIST: PREFERRED MEDIA (For GDELT/Scoring)
+TRUSTED_MEDIA = [
     "bbc.co.uk", "bbc.com", "ft.com", "theguardian.com", "telegraph.co.uk",
     "timeshighereducation.com", "economist.com", "reuters.com", "bloomberg.com",
-    "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk", "science.org", "nature.com",
-    "washingtonpost.com", "nytimes.com", "forbes.com", "weforum.org", "abc.net.au",
-    "theconversation.com", "medium.com", "substack.com"
+    "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk", # Uni News is OK
+    "washingtonpost.com", "nytimes.com", "forbes.com", "weforum.org", 
+    "abc.net.au", "theconversation.com", "medium.com", "substack.com",
+    "newscientist.com", "phys.org", "eurekalert.org"
 ]
 
 # GDELT QUERIES
@@ -58,15 +68,13 @@ def normalize_date(date_obj):
         return None
 
 def extract_date_from_text(text):
-    """Tries to find a date in the text snippet."""
     if not text: return None
     match = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(\d{4}-\d{2}-\d{2})', text)
     if match:
         try:
             dt = date_parser.parse(match.group(0))
             return dt.strftime('%Y-%m-%d')
-        except:
-            pass
+        except: pass
     return None
 
 def clean_html(text):
@@ -76,8 +84,13 @@ def clean_html(text):
     except:
         return str(text)
 
+def is_academic_domain(link):
+    """Returns True if the link is from a blocked academic publisher."""
+    if not link: return False
+    domain = urllib.parse.urlparse(link).netloc.lower()
+    return any(blocked in domain for blocked in ACADEMIC_BLOCKLIST)
+
 def classify_entry(title, snippet, default_type):
-    """Auto-tags content based on keywords."""
     full_text = (str(title) + " " + str(snippet)).lower()
     if "podcast" in full_text or "episode" in full_text: return "Podcast"
     if "radio" in full_text or "bbc radio" in full_text or " fm " in full_text: return "Radio"
@@ -129,9 +142,14 @@ def search_ddg_deep(name):
         with DDGS() as ddgs:
             results = ddgs.text(query, region='wt-wt', safesearch='off', backend='html', max_results=5)
             for r in results:
-                title = r.get('title', '')
                 link = r.get('href', '')
+                
+                # FILTER: Skip Academic Journals
+                if is_academic_domain(link): continue
+                
+                title = r.get('title', '')
                 snippet = r.get('body', '')
+                
                 if verify_affiliation(title + " " + snippet, name):
                     extracted_date = extract_date_from_text(snippet)
                     category = classify_entry(title, snippet, "Talk/Media")
@@ -156,6 +174,11 @@ def search_google_rss(query, mode="Name", academic_name=None, default_type="Medi
     try:
         feed = feedparser.parse(url)
         for entry in feed.entries:
+            link = entry.link
+            
+            # FILTER: Skip Academic Journals
+            if is_academic_domain(link): continue
+            
             title = clean_html(entry.title)
             summary = clean_html(getattr(entry, 'summary', ''))
             full_text = f"{title} {summary}"
@@ -170,7 +193,7 @@ def search_google_rss(query, mode="Name", academic_name=None, default_type="Medi
                 category = classify_entry(title, summary, default_type)
                 hits.append({
                     "LCDS Mention": title,
-                    "Link": entry.link,
+                    "Link": link,
                     "Date Available Online": normalize_date(entry.published),
                     "Type": category,
                     "Source": entry.source.get('title', 'Google News'),
@@ -191,10 +214,16 @@ def fetch_gdelt_impact():
             if r.status_code == 200:
                 data = r.json()
                 for article in data.get('articles', []):
-                    title = article.get('title', '')
                     url = article.get('url', '')
+                    
+                    # FILTER: Skip Academic Journals
+                    if is_academic_domain(url): continue
+                    
+                    title = article.get('title', '')
                     domain = article.get('domain', '').lower()
-                    if any(d in domain for d in TRUSTED_DOMAINS) or domain.endswith((".edu", ".ac.uk")):
+                    
+                    # Trusted Media Check
+                    if any(d in domain for d in TRUSTED_MEDIA) or domain.endswith((".edu", ".ac.uk")):
                         raw_date = article.get('seendate', '')
                         fmt_date = datetime.strptime(raw_date, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%d") if raw_date else None
                         category = classify_entry(title, "", "Global News")
@@ -214,7 +243,7 @@ def fetch_gdelt_impact():
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v7.0 (Atomic Write) ---")
+    print("--- LCDS Tracker v8.0 (Block Journals) ---")
     
     df_orcid = load_orcid_file(INPUT_ORCID_FILE)
     if 'Name' not in df_orcid.columns: 
@@ -223,6 +252,7 @@ def main():
 
     try:
         df_old = pd.read_csv(OUTPUT_FILE)
+        # Clean out old junk
         df_old = df_old[df_old['Type'] != 'Publication']
         existing_links = set(df_old['Link'].astype(str))
         all_data = df_old.to_dict('records')
@@ -276,11 +306,10 @@ def main():
         df_final.sort_values(by='Date Available Online', ascending=False, na_position='last', inplace=True)
         df_final.drop_duplicates(subset='Link', keep='first', inplace=True)
 
-        # ATOMIC WRITE SAFETY
         temp_file = f"{OUTPUT_FILE}.tmp"
         df_final.to_csv(temp_file, index=False)
         os.replace(temp_file, OUTPUT_FILE)
-        print(f"Done. Atomic save complete. {len(df_final)} records.")
+        print(f"Done. {len(df_final)} records.")
 
 if __name__ == "__main__":
     main()

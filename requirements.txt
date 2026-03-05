@@ -4,5 +4,6 @@ requests
 beautifulsoup4
 ddgs
 lxml
+python-dateutil
 plotly
 streamlit

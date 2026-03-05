@@ -25,14 +25,28 @@ st.markdown("""
         box-shadow: 2px 2px 10px rgba(0,0,0,0.1);
     }
     .footer {
-        position: fixed; left: 0; bottom: 0; width: 100%;
-        background-color: var(--secondary-background-color);
-        color: var(--text-color);
-        text-align: center; padding: 10px; font-size: 13px;
-        border-top: 1px solid rgba(150, 150, 150, 0.2);
+        position: fixed; 
+        left: 0; 
+        bottom: 0; 
+        width: 100%;
+        background-color: #002147; /* Oxford Blue */
+        color: white; /* White text for contrast */
+        text-align: center; 
+        padding: 10px; 
+        font-size: 13px;
+        border-top: 1px solid #FFD700; /* Optional: Yellow border top */
+        z-index: 1000;
     }
-    .footer a { color: #0072CE; text-decoration: none; font-weight: bold; }
-    #MainMenu {visibility: hidden;} footer {visibility: hidden;}
+    .footer a { 
+        color: #FFD700 !important; /* Yellow Links */
+        text-decoration: none; 
+        font-weight: bold; 
+    }
+    .footer a:hover {
+        text-decoration: underline;
+    }
+    #MainMenu {visibility: hidden;} 
+    footer {visibility: hidden;}
     .block-container { padding-bottom: 80px; }
 </style>
 """, unsafe_allow_html=True)

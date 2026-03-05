@@ -6,32 +6,26 @@ import time
 import logging
 import re
 import os
+import json
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from dateutil import parser as date_parser
 
-# --- IMPORT DDGS SAFELY ---
-try:
-    from ddgs import DDGS
-except ImportError:
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        DDGS = None
-
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/9.0 (mailto:admin@lcds.ox.ac.uk)"
+MEMORY_FILE = "source_memory.json"
+USER_AGENT = "LCDS_Impact_Tracker/10.0 (mailto:admin@lcds.ox.ac.uk)"
 
-# 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES
-# We block main profile pages to force the search to find EVENTS.
+# 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES + SOCIAL MEDIA
+# We want news ABOUT papers, not the papers themselves.
 URL_BLOCKLIST = [
     "nature.com", "science.org", "sciencedirect.com", "wiley.com", 
     "springer.com", "tandfonline.com", "sagepub.com", "frontiersin.org",
     "plos.org", "mdpi.com", "academic.oup.com", "cambridge.org", 
     "jstor.org", "ncbi.nlm.nih.gov", "researchgate.net", "academia.edu",
-    "/people/", "/staff/", "/profile/", "/biography/", "/cv", "/contact"
+    "/people/", "/staff/", "/profile/", "/biography/", "/cv", "/contact",
+    "linkedin.com", "facebook.com", "twitter.com", "instagram.com"
 ]
 
 TITLE_BLOCKLIST = [
@@ -39,7 +33,7 @@ TITLE_BLOCKLIST = [
     "contact", "about us", "faculty", "home page", "department of"
 ]
 
-# 2. ALLOWLIST (Preferred Media)
+# 2. ALLOWLIST (Preferred Media for GDELT/Scoring)
 TRUSTED_MEDIA = [
     "bbc.co.uk", "bbc.com", "ft.com", "theguardian.com", "telegraph.co.uk",
     "timeshighereducation.com", "economist.com", "reuters.com", "bloomberg.com",
@@ -60,6 +54,26 @@ GDELT_QUERIES = [
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
+# --- MEMORY SYSTEM ---
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, 'r') as f:
+                return json.load(f)
+        except: return {"trusted_sources": []}
+    return {"trusted_sources": []}
+
+def save_memory(memory):
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memory, f)
+
+def update_memory(source_domain, memory):
+    if source_domain not in memory["trusted_sources"]:
+        memory["trusted_sources"].append(source_domain)
+        save_memory(memory)
+        return True 
+    return False
+
 # --- HELPERS ---
 
 def get_date_window():
@@ -73,17 +87,6 @@ def normalize_date(date_obj):
     except:
         return None
 
-def extract_date_from_text(text):
-    if not text: return None
-    # Look for patterns like "5 Jan 2026" or "2026-01-05"
-    match = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(\d{4}-\d{2}-\d{2})', text)
-    if match:
-        try:
-            dt = date_parser.parse(match.group(0))
-            return dt.strftime('%Y-%m-%d')
-        except: pass
-    return None
-
 def clean_html(text):
     if not text: return ""
     try:
@@ -92,26 +95,17 @@ def clean_html(text):
         return str(text)
 
 def is_blocked_content(link, title, name):
-    """
-    Returns True if the result looks like a static profile page or academic paper.
-    """
     link = link.lower()
     title = title.lower()
-    name = name.lower()
+    name = name.lower() if name else ""
     
-    # 1. Check URL Blocklist (Journals + Profile URL patterns)
-    if any(blocked in link for blocked in URL_BLOCKLIST):
-        return True
-        
-    # 2. Check Title Blocklist (Generic words)
-    if any(blocked in title for blocked in TITLE_BLOCKLIST):
-        return True
-        
-    # 3. Check if Title IS just the Name (e.g. "Melinda Mills")
-    # We remove typical suffixes like " | Oxford" to check the core title
-    clean_title = re.sub(r'\s*[|\-–].*', '', title).strip()
-    if clean_title == name:
-        return True
+    if any(blocked in link for blocked in URL_BLOCKLIST): return True
+    if any(blocked in title for blocked in TITLE_BLOCKLIST): return True
+    
+    # Block if title is JUST the name (e.g. "Melinda Mills")
+    if name:
+        clean_title = re.sub(r'\s*[|\-–].*', '', title).strip()
+        if clean_title == name: return True
         
     return False
 
@@ -122,6 +116,7 @@ def classify_entry(title, snippet, default_type):
     if "blog" in full_text or "substack" in full_text or "opinion" in full_text: return "Blog/Opinion"
     if "keynote" in full_text or "plenary" in full_text: return "Keynote"
     if "award" in full_text or "prize" in full_text or "medal" in full_text: return "Award"
+    if "forum" in full_text or "discussion" in full_text: return "Forum/Discussion"
     return default_type
 
 def verify_affiliation(text, name=""):
@@ -159,42 +154,7 @@ def fetch_crossref_titles(orcid):
     except: pass
     return []
 
-def search_ddg_deep(name):
-    if DDGS is None: return []
-    hits = []
-    # Added "News" to query to bias against static pages
-    query = f'"{name}" (keynote OR award OR radio OR podcast OR blog) -site:linkedin.com'
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(query, region='wt-wt', safesearch='off', backend='html', max_results=7)
-            for r in results:
-                link = r.get('href', '')
-                title = r.get('title', '')
-                snippet = r.get('body', '')
-                
-                # FILTER: Block Static Profiles & Journals
-                if is_blocked_content(link, title, name): 
-                    continue
-                
-                if verify_affiliation(title + " " + snippet, name):
-                    extracted_date = extract_date_from_text(snippet)
-                    category = classify_entry(title, snippet, "Talk/Media")
-                    
-                    hits.append({
-                        "LCDS Mention": title,
-                        "Link": link,
-                        "Date Available Online": extracted_date, 
-                        "Type": category,
-                        "Source": "DuckDuckGo",
-                        "Name": name,
-                        "Snippet": snippet[:400]
-                    })
-                time.sleep(0.5) 
-    except Exception as e:
-        logging.warning(f"DDG error for {name}: {e}")
-    return hits
-
-def search_google_rss(query, mode="Name", academic_name=None, default_type="Media Mention"):
+def search_google_rss(query, mode="Name", academic_name=None, default_type="Media Mention", memory=None):
     encoded = urllib.parse.quote(query)
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
     hits = []
@@ -204,7 +164,6 @@ def search_google_rss(query, mode="Name", academic_name=None, default_type="Medi
             link = entry.link
             title = clean_html(entry.title)
             
-            # FILTER: Block Static Profiles & Journals
             if is_blocked_content(link, title, academic_name): 
                 continue
             
@@ -218,6 +177,10 @@ def search_google_rss(query, mode="Name", academic_name=None, default_type="Medi
                 valid = True 
             
             if valid:
+                # LEARN SOURCE
+                domain = urllib.parse.urlparse(link).netloc
+                if memory is not None: update_memory(domain, memory)
+
                 category = classify_entry(title, summary, default_type)
                 hits.append({
                     "LCDS Mention": title,
@@ -231,7 +194,7 @@ def search_google_rss(query, mode="Name", academic_name=None, default_type="Medi
     except: pass
     return hits
 
-def fetch_gdelt_impact():
+def fetch_gdelt_impact(memory=None):
     print("  Running GDELT Global Scan...")
     hits = []
     base_url = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -248,7 +211,15 @@ def fetch_gdelt_impact():
                     if is_blocked_content(url, title, "LCDS"): continue
                     
                     domain = article.get('domain', '').lower()
-                    if any(d in domain for d in TRUSTED_MEDIA) or domain.endswith((".edu", ".ac.uk")):
+                    
+                    # Check Trust (Allowlist OR Memory)
+                    is_known = any(d in domain for d in TRUSTED_MEDIA) or domain.endswith((".edu", ".ac.uk"))
+                    if memory and domain in memory.get("trusted_sources", []):
+                        is_known = True
+
+                    if is_known:
+                        if memory is not None: update_memory(domain, memory)
+
                         raw_date = article.get('seendate', '')
                         fmt_date = datetime.strptime(raw_date, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%d") if raw_date else None
                         category = classify_entry(title, "", "Global News")
@@ -268,23 +239,32 @@ def fetch_gdelt_impact():
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v9.0 (No Profiles) ---")
+    print("--- LCDS Tracker v10.0 (Clean & Smart) ---")
     
+    # 1. LOAD MEMORY
+    memory = load_memory()
+    print(f"Memory: Tracking {len(memory['trusted_sources'])} trusted sources.")
+
     df_orcid = load_orcid_file(INPUT_ORCID_FILE)
     if 'Name' not in df_orcid.columns: 
         print("Error: Name column missing in ORCID file.")
         return
 
+    # 2. LOAD EXISTING DATA (For De-duplication)
+    # We assume you have DELETED the old file for a fresh start, 
+    # but this handles subsequent runs.
     try:
         df_old = pd.read_csv(OUTPUT_FILE)
+        # Ensure we filter out old 'Publication' types just in case
         df_old = df_old[df_old['Type'] != 'Publication']
         existing_links = set(df_old['Link'].astype(str))
         all_data = df_old.to_dict('records')
-        print(f"Loaded {len(df_old)} clean records.")
+        print(f"Loaded {len(df_old)} existing records.")
     except:
         existing_links = set()
         all_data = []
 
+    # 3. PROCESS PEOPLE
     for _, row in df_orcid.iterrows():
         name = row['Name']
         orcid_col = next((c for c in df_orcid.columns if c.lower() == 'orcid'), None)
@@ -292,48 +272,63 @@ def main():
         
         print(f"Scanning: {name}")
 
+        # A. Crossref Seed -> News
         titles = fetch_crossref_titles(orcid)
         for t in titles:
-            hits = search_google_rss(f'"{t}"', mode="Pub", academic_name=name, default_type="Research Coverage")
+            hits = search_google_rss(f'"{t}"', mode="Pub", academic_name=name, default_type="Research Coverage", memory=memory)
             for h in hits:
                 if h['Link'] not in existing_links:
                     all_data.append(h)
                     existing_links.add(h['Link'])
             time.sleep(0.5)
 
-        hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name, default_type="Media Mention")
+        # B. Direct Name Search (Media)
+        hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name, default_type="Media Mention", memory=memory)
         for h in hits:
             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
         
-        ddg_hits = search_ddg_deep(name)
-        for h in ddg_hits:
-            if h['Link'] not in existing_links:
-                if not h['Date Available Online']: h['Date Available Online'] = "" 
+        # C. Event Search (Keynote/Award) - via Google News, NO DDG
+        event_query = f'"{name}" AND (keynote OR plenary OR award OR prize)'
+        event_hits = search_google_rss(event_query, mode="Name", academic_name=name, default_type="Talk/Award", memory=memory)
+        for h in event_hits:
+             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
+
         time.sleep(1)
 
-    gdelt_hits = fetch_gdelt_impact()
+    # 4. PROCESS GDELT (GLOBAL)
+    gdelt_hits = fetch_gdelt_impact(memory=memory)
     for h in gdelt_hits:
         if h['Link'] not in existing_links:
             all_data.append(h)
             existing_links.add(h['Link'])
 
+    # 5. SAVE
     df_final = pd.DataFrame(all_data)
     if not df_final.empty:
+        # Date Cleaning
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
         s_date, e_date = get_date_window()
+        
+        # Filter: Date in range OR Date is Missing (Keep NaT)
         mask = ((df_final['Date Available Online'] >= s_date) & (df_final['Date Available Online'] <= e_date)) | (df_final['Date Available Online'].isna())
         df_final = df_final[mask]
+        
+        # Sort & Dedup
         df_final.sort_values(by='Date Available Online', ascending=False, na_position='last', inplace=True)
         df_final.drop_duplicates(subset='Link', keep='first', inplace=True)
 
+        # Atomic Write
         temp_file = f"{OUTPUT_FILE}.tmp"
         df_final.to_csv(temp_file, index=False)
         os.replace(temp_file, OUTPUT_FILE)
-        print(f"Done. {len(df_final)} records.")
+        print(f"Done. Saved {len(df_final)} records safely.")
+        
+        # Save Memory
+        save_memory(memory)
 
 if __name__ == "__main__":
     main()

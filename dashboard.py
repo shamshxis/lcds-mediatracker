@@ -153,25 +153,31 @@ c3.metric("New (7 Days)", new_count)
 
 st.markdown("---")
 
-# CHARTS
+# CHARTS (SAFE MODE)
 col1, col2 = st.columns([2,1])
 with col1:
-    if 'Week' not in filtered_df.columns and not filtered_df.empty:
+    # ⚠️ FIX: Check if data exists before grouping
+    if not filtered_df.empty:
+        # Create Week column only if we have data
         filtered_df['Week'] = filtered_df['Date Available Online'].dt.to_period('W').apply(lambda r: r.start_time)
         
-    daily = filtered_df.groupby(['Week', 'Type']).size().reset_index(name='Count')
-    if not daily.empty:
-        fig = px.bar(daily, x='Week', y='Count', color='Type', title="Weekly Volume")
-        st.plotly_chart(fig, use_container_width=True)
+        daily = filtered_df.groupby(['Week', 'Type']).size().reset_index(name='Count')
+        if not daily.empty:
+            fig = px.bar(daily, x='Week', y='Count', color='Type', title="Weekly Volume")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Not enough data for timeline chart.")
     else:
-        st.info("Not enough data for timeline chart.")
+        st.info("No data found for this time window.")
     
 with col2:
-    if 'Name' in filtered_df.columns:
+    if not filtered_df.empty and 'Name' in filtered_df.columns:
         top = filtered_df['Name'].value_counts().head(5).reset_index()
         top.columns = ['Name', 'Count']
         fig2 = px.pie(top, values='Count', names='Name', hole=0.4, title="Top Academics")
         st.plotly_chart(fig2, use_container_width=True)
+    elif filtered_df.empty:
+        st.write("") # Spacer
 
 # TABLE
 st.subheader("📄 Latest Updates")
@@ -187,10 +193,8 @@ st.dataframe(
 
 # --- FOOTER INJECTION ---
 st.markdown("""
-<div class="footer">
-    <p>
-        © 2026 <b>Leverhulme Centre for Demographic Science | University of Oxford </b><br>
-        <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> | 
-    </p>
+<div class="footer" align="center">
+        © 2026 Leverhulme Centre for Demographic Science</b> | University of Oxford <br>
+        <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> 
 </div>
 """, unsafe_allow_html=True)

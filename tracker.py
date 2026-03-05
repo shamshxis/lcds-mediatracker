@@ -22,22 +22,28 @@ except ImportError:
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/8.0 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/9.0 (mailto:admin@lcds.ox.ac.uk)"
 
-# 1. BLOCKLIST: EXCLUDE DIRECT ACADEMIC JOURNALS
-# We want news ABOUT papers, not the papers themselves.
-ACADEMIC_BLOCKLIST = [
+# 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES
+# We block main profile pages to force the search to find EVENTS.
+URL_BLOCKLIST = [
     "nature.com", "science.org", "sciencedirect.com", "wiley.com", 
     "springer.com", "tandfonline.com", "sagepub.com", "frontiersin.org",
     "plos.org", "mdpi.com", "academic.oup.com", "cambridge.org", 
-    "jstor.org", "ncbi.nlm.nih.gov", "researchgate.net", "academia.edu"
+    "jstor.org", "ncbi.nlm.nih.gov", "researchgate.net", "academia.edu",
+    "/people/", "/staff/", "/profile/", "/biography/", "/cv", "/contact"
 ]
 
-# 2. ALLOWLIST: PREFERRED MEDIA (For GDELT/Scoring)
+TITLE_BLOCKLIST = [
+    "profile", "biography", "curriculum vitae", "cv", "staff", "people", 
+    "contact", "about us", "faculty", "home page", "department of"
+]
+
+# 2. ALLOWLIST (Preferred Media)
 TRUSTED_MEDIA = [
     "bbc.co.uk", "bbc.com", "ft.com", "theguardian.com", "telegraph.co.uk",
     "timeshighereducation.com", "economist.com", "reuters.com", "bloomberg.com",
-    "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk", # Uni News is OK
+    "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk",
     "washingtonpost.com", "nytimes.com", "forbes.com", "weforum.org", 
     "abc.net.au", "theconversation.com", "medium.com", "substack.com",
     "newscientist.com", "phys.org", "eurekalert.org"
@@ -69,6 +75,7 @@ def normalize_date(date_obj):
 
 def extract_date_from_text(text):
     if not text: return None
+    # Look for patterns like "5 Jan 2026" or "2026-01-05"
     match = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(\d{4}-\d{2}-\d{2})', text)
     if match:
         try:
@@ -84,11 +91,29 @@ def clean_html(text):
     except:
         return str(text)
 
-def is_academic_domain(link):
-    """Returns True if the link is from a blocked academic publisher."""
-    if not link: return False
-    domain = urllib.parse.urlparse(link).netloc.lower()
-    return any(blocked in domain for blocked in ACADEMIC_BLOCKLIST)
+def is_blocked_content(link, title, name):
+    """
+    Returns True if the result looks like a static profile page or academic paper.
+    """
+    link = link.lower()
+    title = title.lower()
+    name = name.lower()
+    
+    # 1. Check URL Blocklist (Journals + Profile URL patterns)
+    if any(blocked in link for blocked in URL_BLOCKLIST):
+        return True
+        
+    # 2. Check Title Blocklist (Generic words)
+    if any(blocked in title for blocked in TITLE_BLOCKLIST):
+        return True
+        
+    # 3. Check if Title IS just the Name (e.g. "Melinda Mills")
+    # We remove typical suffixes like " | Oxford" to check the core title
+    clean_title = re.sub(r'\s*[|\-–].*', '', title).strip()
+    if clean_title == name:
+        return True
+        
+    return False
 
 def classify_entry(title, snippet, default_type):
     full_text = (str(title) + " " + str(snippet)).lower()
@@ -137,22 +162,24 @@ def fetch_crossref_titles(orcid):
 def search_ddg_deep(name):
     if DDGS is None: return []
     hits = []
-    query = f'"{name}" (keynote OR award OR radio OR podcast OR blog) demography'
+    # Added "News" to query to bias against static pages
+    query = f'"{name}" (keynote OR award OR radio OR podcast OR blog) -site:linkedin.com'
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(query, region='wt-wt', safesearch='off', backend='html', max_results=5)
+            results = ddgs.text(query, region='wt-wt', safesearch='off', backend='html', max_results=7)
             for r in results:
                 link = r.get('href', '')
-                
-                # FILTER: Skip Academic Journals
-                if is_academic_domain(link): continue
-                
                 title = r.get('title', '')
                 snippet = r.get('body', '')
+                
+                # FILTER: Block Static Profiles & Journals
+                if is_blocked_content(link, title, name): 
+                    continue
                 
                 if verify_affiliation(title + " " + snippet, name):
                     extracted_date = extract_date_from_text(snippet)
                     category = classify_entry(title, snippet, "Talk/Media")
+                    
                     hits.append({
                         "LCDS Mention": title,
                         "Link": link,
@@ -175,11 +202,12 @@ def search_google_rss(query, mode="Name", academic_name=None, default_type="Medi
         feed = feedparser.parse(url)
         for entry in feed.entries:
             link = entry.link
-            
-            # FILTER: Skip Academic Journals
-            if is_academic_domain(link): continue
-            
             title = clean_html(entry.title)
+            
+            # FILTER: Block Static Profiles & Journals
+            if is_blocked_content(link, title, academic_name): 
+                continue
+            
             summary = clean_html(getattr(entry, 'summary', ''))
             full_text = f"{title} {summary}"
             
@@ -215,14 +243,11 @@ def fetch_gdelt_impact():
                 data = r.json()
                 for article in data.get('articles', []):
                     url = article.get('url', '')
-                    
-                    # FILTER: Skip Academic Journals
-                    if is_academic_domain(url): continue
-                    
                     title = article.get('title', '')
-                    domain = article.get('domain', '').lower()
                     
-                    # Trusted Media Check
+                    if is_blocked_content(url, title, "LCDS"): continue
+                    
+                    domain = article.get('domain', '').lower()
                     if any(d in domain for d in TRUSTED_MEDIA) or domain.endswith((".edu", ".ac.uk")):
                         raw_date = article.get('seendate', '')
                         fmt_date = datetime.strptime(raw_date, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%d") if raw_date else None
@@ -243,7 +268,7 @@ def fetch_gdelt_impact():
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v8.0 (Block Journals) ---")
+    print("--- LCDS Tracker v9.0 (No Profiles) ---")
     
     df_orcid = load_orcid_file(INPUT_ORCID_FILE)
     if 'Name' not in df_orcid.columns: 
@@ -252,7 +277,6 @@ def main():
 
     try:
         df_old = pd.read_csv(OUTPUT_FILE)
-        # Clean out old junk
         df_old = df_old[df_old['Type'] != 'Publication']
         existing_links = set(df_old['Link'].astype(str))
         all_data = df_old.to_dict('records')

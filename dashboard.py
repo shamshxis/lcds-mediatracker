@@ -59,7 +59,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- LOAD DATA (FAIL-SAFE) ---
-@st.cache_data(ttl=300)
+# We use a shorter TTL (Time To Live) so it auto-refreshes every 60 seconds
+@st.cache_data(ttl=60)
 def load_data():
     if not os.path.exists(FILE_PATH):
         return None
@@ -76,6 +77,18 @@ def load_data():
     except Exception:
         return pd.DataFrame()
 
+# --- SIDEBAR CONTROLS ---
+with st.sidebar:
+    st.header("⚙️ Controls")
+    
+    # THE FIX: Manual Refresh Button
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear() # Wipes the memory
+        st.rerun()            # Reloads the app
+    
+    st.divider()
+
+# --- DATA LOADING ---
 df = load_data()
 
 # --- CASE 1: FILE IS MISSING (First Run) ---
@@ -109,7 +122,13 @@ with st.sidebar:
     # We define it here but populate data after filtering below
     download_placeholder = st.empty()
     
-    st.caption(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    # Get the file timestamp to show true "Last Updated"
+    try:
+        last_mod_time = datetime.fromtimestamp(os.path.getmtime(FILE_PATH)).strftime('%Y-%m-%d %H:%M')
+    except:
+        last_mod_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+        
+    st.caption(f"Data Last Updated: {last_mod_time}")
 
 # --- FILTERING ---
 filtered_df = df.copy()
@@ -156,7 +175,6 @@ st.markdown("---")
 # CHARTS (SAFE MODE)
 col1, col2 = st.columns([2,1])
 with col1:
-    # ⚠️ FIX: Check if data exists before grouping
     if not filtered_df.empty:
         # Create Week column only if we have data
         filtered_df['Week'] = filtered_df['Date Available Online'].dt.to_period('W').apply(lambda r: r.start_time)
@@ -195,6 +213,6 @@ st.dataframe(
 st.markdown("""
 <div class="footer" align="center">
         © 2026 Leverhulme Centre for Demographic Science</b> | University of Oxford <br>
-        <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> 
+        <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> | 
 </div>
 """, unsafe_allow_html=True)

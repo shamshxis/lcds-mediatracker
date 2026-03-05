@@ -94,7 +94,8 @@ if df.empty:
 # --- CASE 3: DASHBOARD LOADED ---
 with st.sidebar:
     st.header("🔍 Filters")
-    time_filter = st.radio("Time Window", ["± 6 Months", "Last Month", "Last Week"], index=0)
+    # Default is ± 6 Months
+    time_filter = st.radio("Time Window", ["± 6 Months (Default)", "Last Month", "Last Week"], index=0)
     
     if 'Type' in df.columns:
         types = ["All"] + sorted(list(df['Type'].dropna().unique()))
@@ -103,6 +104,11 @@ with st.sidebar:
         selected_type = "All"
         
     st.divider()
+    
+    # DOWNLOAD BUTTON LOGIC
+    # We define it here but populate data after filtering below
+    download_placeholder = st.empty()
+    
     st.caption(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 # --- FILTERING ---
@@ -114,6 +120,7 @@ if time_filter == "Last Week":
 elif time_filter == "Last Month":
     filtered_df = filtered_df[filtered_df['Date Available Online'] >= (today - timedelta(days=30))]
 else:
+    # ± 6 Months Window
     s = today - timedelta(days=180)
     e = today + timedelta(days=180)
     filtered_df = filtered_df[(filtered_df['Date Available Online'] >= s) & (filtered_df['Date Available Online'] <= e)]
@@ -123,6 +130,16 @@ if selected_type != "All":
 
 # Sort: Newest first, putting 'Unknown Dates' (NaT) at the bottom
 filtered_df.sort_values(by='Date Available Online', ascending=False, na_position='last', inplace=True)
+
+# --- POPULATE DOWNLOAD BUTTON ---
+with st.sidebar:
+    csv = filtered_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Current View (CSV)",
+        data=csv,
+        file_name=f"lcds_tracker_view_{datetime.now().strftime('%Y-%m-%d')}.csv",
+        mime="text/csv",
+    )
 
 # --- MAIN UI ---
 st.title("🔬 LCDS Research & Media Tracker")
@@ -172,7 +189,7 @@ st.dataframe(
 st.markdown("""
 <div class="footer">
     <p>
-        © 2026 <b>Leverhulme Centre for Demographic Science | University of Oxford </b><br>
+        © 2026 <b>Leverhulme Centre for Demographic Science | University of Oxford </b> <br>
         <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> | 
     </p>
 </div>

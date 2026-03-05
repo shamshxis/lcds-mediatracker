@@ -4,15 +4,15 @@ import requests
 import urllib.parse
 import time
 import logging
-import sys
+import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from dateutil import parser as date_parser
 
 # --- IMPORT DDGS SAFELY ---
 try:
     from ddgs import DDGS
 except ImportError:
-    # Handle case where user installed the old 'duckduckgo_search' package
     try:
         from duckduckgo_search import DDGS
     except ImportError:
@@ -21,14 +21,15 @@ except ImportError:
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/6.0 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/7.0 (mailto:admin@lcds.ox.ac.uk)"
 
-# DOMAIN ALLOWLIST FOR GDELT
+# DOMAIN ALLOWLIST (Strict Quality Control)
 TRUSTED_DOMAINS = [
     "bbc.co.uk", "bbc.com", "ft.com", "theguardian.com", "telegraph.co.uk",
     "timeshighereducation.com", "economist.com", "reuters.com", "bloomberg.com",
     "ox.ac.uk", "nuffield.ox.ac.uk", "demography.ox.ac.uk", "science.org", "nature.com",
-    "washingtonpost.com", "nytimes.com", "forbes.com", "weforum.org", "abc.net.au"
+    "washingtonpost.com", "nytimes.com", "forbes.com", "weforum.org", "abc.net.au",
+    "theconversation.com", "medium.com", "substack.com"
 ]
 
 # GDELT QUERIES
@@ -55,6 +56,23 @@ def normalize_date(date_obj):
     except:
         return None
 
+def extract_date_from_text(text):
+    """
+    Tries to find a date in the text snippet (e.g., 'Jan 5, 2026') 
+    when the API doesn't provide one.
+    """
+    if not text: return None
+    
+    # Regex for patterns like "5 Jan 2026" or "2026-01-05"
+    match = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(\d{4}-\d{2}-\d{2})', text)
+    if match:
+        try:
+            dt = date_parser.parse(match.group(0))
+            return dt.strftime('%Y-%m-%d')
+        except:
+            pass
+    return None
+
 def clean_html(text):
     if not text: return ""
     try:
@@ -62,10 +80,26 @@ def clean_html(text):
     except:
         return str(text)
 
+def classify_entry(title, snippet, default_type):
+    """
+    Auto-tags content based on keywords in the title/snippet.
+    """
+    full_text = (str(title) + " " + str(snippet)).lower()
+    
+    if "podcast" in full_text or "episode" in full_text:
+        return "Podcast"
+    if "radio" in full_text or "bbc radio" in full_text or " fm " in full_text:
+        return "Radio"
+    if "blog" in full_text or "substack" in full_text or "opinion" in full_text:
+        return "Blog/Opinion"
+    if "keynote" in full_text or "plenary" in full_text:
+        return "Keynote"
+    if "award" in full_text or "prize" in full_text or "medal" in full_text:
+        return "Award"
+        
+    return default_type
+
 def verify_affiliation(text, name=""):
-    """
-    Checks if text contains LCDS context.
-    """
     text_lower = text.lower()
     affiliations = ["oxford", "leverhulme", "lcds", "nuffield", "demographic", "population", "sociology"]
     
@@ -73,7 +107,6 @@ def verify_affiliation(text, name=""):
         return False
         
     has_aff = any(a in text_lower for a in affiliations)
-    
     if name and "melinda mills" in name.lower() and "groningen" in text_lower:
         has_aff = True
 
@@ -89,7 +122,7 @@ def load_orcid_file(filepath):
 # --- DATA FETCHERS ---
 
 def fetch_crossref_titles(orcid):
-    """Fetches titles for SEARCH SEED only."""
+    """Fetches titles only. DOES NOT SAVE THEM."""
     if not orcid or str(orcid) == "nan": return []
     s_date, e_date = get_date_window()
     url = f"https://api.crossref.org/works?filter=orcid:{orcid},from-pub-date:{s_date.strftime('%Y-%m-%d')},until-pub-date:{e_date.strftime('%Y-%m-%d')}"
@@ -103,19 +136,17 @@ def fetch_crossref_titles(orcid):
 
 def search_ddg_deep(name):
     """
-    DuckDuckGo Search (Restored & Safe-Guarded).
-    Uses backend='html' to avoid the Wikipedia API crash.
+    DuckDuckGo with Date Extraction.
     """
-    if DDGS is None:
-        return []
+    if DDGS is None: return []
 
     hits = []
-    # Query for Prestige Events
-    query = f'"{name}" (keynote OR plenary OR award OR prize) demography'
+    # Broaden query to capture Radio/Blogs too
+    query = f'"{name}" (keynote OR award OR radio OR podcast OR blog) demography'
     
     try:
         with DDGS() as ddgs:
-            # backend='html' bypasses the unstable 'api'/'instant answer' endpoints
+            # backend='html' is safer
             results = ddgs.text(query, region='wt-wt', safesearch='off', backend='html', max_results=5)
             
             for r in results:
@@ -123,26 +154,29 @@ def search_ddg_deep(name):
                 link = r.get('href', '')
                 snippet = r.get('body', '')
                 
-                # Verify Context
                 if verify_affiliation(title + " " + snippet, name):
+                    # Try to extract date from text, else leave None (do not force today)
+                    extracted_date = extract_date_from_text(snippet)
+                    
+                    # Auto-Classify
+                    category = classify_entry(title, snippet, "Talk/Media")
+                    
                     hits.append({
                         "LCDS Mention": title,
                         "Link": link,
-                        "Date Available Online": datetime.now().strftime('%Y-%m-%d'), # DDG doesn't give precise dates
-                        "Type": "Talk/Award",
+                        "Date Available Online": extracted_date, # Can be None
+                        "Type": category,
                         "Source": "DuckDuckGo",
                         "Name": name,
                         "Snippet": snippet[:400]
                     })
                 time.sleep(0.5) 
     except Exception as e:
-        # ⚠️ Log error but DO NOT CRASH the script
-        logging.warning(f"DDG Search skipped for {name} due to error: {e}")
+        logging.warning(f"DDG error for {name}: {e}")
         
     return hits
 
-def search_google_rss(query, mode="Name", academic_name=None, entry_type="Media Mention"):
-    """Standard RSS Search"""
+def search_google_rss(query, mode="Name", academic_name=None, default_type="Media Mention"):
     encoded = urllib.parse.quote(query)
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
     hits = []
@@ -160,11 +194,13 @@ def search_google_rss(query, mode="Name", academic_name=None, entry_type="Media 
                 valid = True 
             
             if valid:
+                category = classify_entry(title, summary, default_type)
+                
                 hits.append({
                     "LCDS Mention": title,
                     "Link": entry.link,
                     "Date Available Online": normalize_date(entry.published),
-                    "Type": entry_type,
+                    "Type": category,
                     "Source": entry.source.get('title', 'Google News'),
                     "Name": academic_name,
                     "Snippet": summary[:400]
@@ -173,7 +209,6 @@ def search_google_rss(query, mode="Name", academic_name=None, entry_type="Media 
     return hits
 
 def fetch_gdelt_impact():
-    """GDELT 2.0 Doc API"""
     print("  Running GDELT Global Scan...")
     hits = []
     base_url = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -192,11 +227,14 @@ def fetch_gdelt_impact():
                     if any(d in domain for d in TRUSTED_DOMAINS) or domain.endswith((".edu", ".ac.uk")):
                         raw_date = article.get('seendate', '')
                         fmt_date = datetime.strptime(raw_date, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%d") if raw_date else None
+                        
+                        category = classify_entry(title, "", "Global News")
+                        
                         hits.append({
                             "LCDS Mention": title,
                             "Link": url,
                             "Date Available Online": fmt_date,
-                            "Type": "Global News/Transcript",
+                            "Type": category,
                             "Source": article.get('sourcegeography', 'GDELT'),
                             "Name": "LCDS General",
                             "Snippet": f"Sourced via GDELT (Domain: {domain})"
@@ -209,7 +247,7 @@ def fetch_gdelt_impact():
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v6.0 (DDGS + GDELT) ---")
+    print("--- LCDS Tracker v7.0 (Smart Dates & Categories) ---")
     
     df_orcid = load_orcid_file(INPUT_ORCID_FILE)
     if 'Name' not in df_orcid.columns: 
@@ -219,9 +257,11 @@ def main():
     # Load Existing
     try:
         df_old = pd.read_csv(OUTPUT_FILE)
+        # CLEANUP: Remove old 'Publication' types (Crossref raw data)
+        df_old = df_old[df_old['Type'] != 'Publication']
         existing_links = set(df_old['Link'].astype(str))
         all_data = df_old.to_dict('records')
-        print(f"Loaded {len(df_old)} existing records.")
+        print(f"Loaded {len(df_old)} clean records.")
     except:
         existing_links = set()
         all_data = []
@@ -234,27 +274,33 @@ def main():
         
         print(f"Scanning: {name}")
 
-        # A. Crossref Seed -> News
+        # A. Crossref Seed -> News (Category: Research Coverage)
         titles = fetch_crossref_titles(orcid)
         for t in titles:
-            hits = search_google_rss(f'"{t}"', mode="Pub", academic_name=name, entry_type="Research Coverage")
+            hits = search_google_rss(f'"{t}"', mode="Pub", academic_name=name, default_type="Research Coverage")
             for h in hits:
                 if h['Link'] not in existing_links:
                     all_data.append(h)
                     existing_links.add(h['Link'])
             time.sleep(0.5)
 
-        # B. Direct Name Search (Media)
-        hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name, entry_type="Media Mention")
+        # B. Direct Name Search (Category: Media Mention)
+        hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name, default_type="Media Mention")
         for h in hits:
             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
         
-        # C. Deep Events (DuckDuckGo Restored)
+        # C. Deep Search (Category: Talk/Media)
         ddg_hits = search_ddg_deep(name)
         for h in ddg_hits:
             if h['Link'] not in existing_links:
+                # If date is missing, try to infer it from current context or drop if critical
+                if not h['Date Available Online']:
+                     # Optional: Keep it anyway or drop? 
+                     # For now, we keep it but it will be sorted last.
+                     h['Date Available Online'] = "" 
+                
                 all_data.append(h)
                 existing_links.add(h['Link'])
 
@@ -267,18 +313,29 @@ def main():
             all_data.append(h)
             existing_links.add(h['Link'])
 
-    # 3. SAVE
+    # 3. SAVE & CLEAN
     df_final = pd.DataFrame(all_data)
     if not df_final.empty:
+        # Convert date safely
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
         s_date, e_date = get_date_window()
         
-        df_final = df_final[
+        # Filter Window (Drop rows with Valid Dates that are too old)
+        # Rows with NaT (No Date) are KEPT for manual review unless you want to drop them.
+        # Here we keep NaT to avoid losing hard-to-date Keynotes.
+        mask = (
             (df_final['Date Available Online'] >= s_date) & 
             (df_final['Date Available Online'] <= e_date)
-        ]
+        ) | (df_final['Date Available Online'].isna())
         
-        df_final.sort_values('Date Available Online', ascending=False, inplace=True)
+        df_final = df_final[mask]
+        
+        # Sort: Newest first, NaT last
+        df_final.sort_values(by='Date Available Online', ascending=False, na_position='last', inplace=True)
+        
+        # Deduplicate by Link
+        df_final.drop_duplicates(subset='Link', keep='first', inplace=True)
+
         df_final.to_csv(OUTPUT_FILE, index=False)
         print(f"Done. Saved {len(df_final)} records.")
 

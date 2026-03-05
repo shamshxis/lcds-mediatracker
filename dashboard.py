@@ -189,7 +189,7 @@ st.dataframe(
 st.markdown("""
 <div class="footer">
     <p>
-        © 2026 <b>Leverhulme Centre for Demographic Science | University of Oxford </b> <br>
+        © 2026 <b>Leverhulme Centre for Demographic Science | University of Oxford </b><br>
         <a href="https://www.demography.ox.ac.uk/" target="_blank">demography.ox.ac.uk</a> | 
     </p>
 </div>

@@ -3,267 +3,235 @@ import feedparser
 import requests
 import urllib.parse
 import time
-import re
-from datetime import datetime, timedelta
 import logging
 import sys
+import random
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+from duckduckgo_search import DDGS  # New library for deep search
 
 # --- CONFIGURATION ---
 INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
-USER_AGENT = "LCDS_Impact_Tracker/2.1 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/3.0 (mailto:admin@lcds.ox.ac.uk)"
 
-# Affiliations to Verify (Lowercase for matching)
+# Keywords for High-Prestige Events
+EVENT_KEYWORDS = ["keynote", "plenary", "distinguished lecture", "award", "prize", "medal", "fellowship", "honorary"]
+
+# Affiliations for Verification
 AFFILIATIONS = [
-    "university of oxford",
-    "oxford university",
-    "leverhulme centre",
-    "leverhulme center",
-    "lcds",
-    "nuffield college",
-    "department of sociology",
-    "population studies"
+    "university of oxford", "oxford university", "leverhulme", "lcds", 
+    "nuffield college", "sociology", "demographic", "population"
 ]
 
-# --- SETUP LOGGING ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# --- HELPERS ---
 
 def get_date_window():
-    """Returns the start and end date for the ±6 month window."""
+    """±6 Months Window"""
     today = datetime.now()
-    start_date = today - timedelta(days=180)
-    end_date = today + timedelta(days=180)
-    return start_date, end_date
+    return today - timedelta(days=180), today + timedelta(days=180)
 
-def normalize_date(date_str):
-    """Attempts to parse various date formats into YYYY-MM-DD."""
-    if not date_str:
-        return None
+def normalize_date(date_obj):
+    if not date_obj: return None
     try:
-        return pd.to_datetime(date_str, utc=True).strftime('%Y-%m-%d')
+        return pd.to_datetime(date_obj).strftime('%Y-%m-%d')
     except:
         return None
 
-def load_orcid_file(filepath):
-    """Robust file loader that handles different encodings (UTF-8, Latin-1, etc)."""
-    encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'ISO-8859-1']
-    
-    for encoding in encodings_to_try:
-        try:
-            return pd.read_csv(filepath, encoding=encoding)
-        except UnicodeDecodeError:
-            continue
-        except FileNotFoundError:
-            logging.error(f"File not found: {filepath}")
-            sys.exit(1)
-            
-    # If all fail, try forcing it with python engine
+def clean_html(text):
+    if not text: return ""
     try:
-        return pd.read_csv(filepath, encoding='utf-8', errors='replace')
-    except Exception as e:
-        logging.error(f"CRITICAL: Could not read {filepath}. Please save it as standard CSV (UTF-8). Error: {e}")
-        sys.exit(1)
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ").strip()
+    except:
+        return str(text)
 
 def verify_affiliation(text, name):
-    """
-    NLP-lite: Checks if the text contains the academic's name AND a valid affiliation.
-    """
+    """Checks if text contains Name + (Affiliation OR Event Keyword)."""
     text_lower = text.lower()
-    
-    # 1. Check strict name match
     if name.lower() not in text_lower:
         return False
-        
-    # 2. Define valid affiliations for this person
-    valid_affiliations = AFFILIATIONS.copy()
-    if "melinda mills" in name.lower():
-        valid_affiliations.append("university of groningen")
-        valid_affiliations.append("groningen university")
-
-    # 3. Scan text for any valid affiliation
-    for aff in valid_affiliations:
-        if aff in text_lower:
-            return True
-            
-    return False
-
-def fetch_crossref_pubs(orcid):
-    """
-    Fetches publications from Crossref for the specified ORCID (±6 months).
-    """
-    if not orcid or str(orcid) == "nan":
-        return []
-
-    start_date, end_date = get_date_window()
     
-    # Crossref API (Polite Pool)
-    url = f"https://api.crossref.org/works?filter=orcid:{orcid},from-pub-date:{start_date.strftime('%Y-%m-%d')},until-pub-date:{end_date.strftime('%Y-%m-%d')}"
-    headers = {"User-Agent": USER_AGENT}
+    # Check for affiliation OR a specific event type (like 'Keynote')
+    has_aff = any(a in text_lower for a in AFFILIATIONS)
+    has_event = any(e in text_lower for e in EVENT_KEYWORDS)
+    
+    # For Melinda Mills, check Groningen specifically
+    if "melinda mills" in name.lower() and ("groningen" in text_lower):
+        has_aff = True
+
+    return has_aff or has_event
+
+def load_orcid_file(filepath):
+    try:
+        return pd.read_csv(filepath) # Assuming UTF-8 standard now
+    except:
+        try:
+            return pd.read_csv(filepath, encoding='latin1')
+        except Exception as e:
+            logging.error(f"Failed to load CSV: {e}")
+            sys.exit(1)
+
+# --- DATA FETCHERS ---
+
+def fetch_crossref_titles(orcid):
+    """Fetches titles for SEARCH only. Does not return full records."""
+    if not orcid or str(orcid) == "nan": return []
+    
+    s_date, e_date = get_date_window()
+    url = f"https://api.crossref.org/works?filter=orcid:{orcid},from-pub-date:{s_date.strftime('%Y-%m-%d')},until-pub-date:{e_date.strftime('%Y-%m-%d')}"
     
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
         if r.status_code == 200:
-            data = r.json()
-            items = data.get('message', {}).get('items', [])
-            pubs = []
-            for item in items:
-                title = item.get('title', [''])[0]
-                title = " ".join(title.split()) # Clean whitespace
-                if title:
-                    pubs.append({
-                        "Title": title,
-                        "DOI": item.get('DOI', ''),
-                        "Date": "/".join(map(str, item.get('created', {}).get('date-parts', [[0,0,0]])[0])),
-                        "Type": "Publication"
-                    })
-            return pubs
-    except Exception as e:
-        logging.error(f"Crossref error for {orcid}: {e}")
-    
+            items = r.json().get('message', {}).get('items', [])
+            # Return only titles longer than 20 chars
+            return [clean_html(i.get('title', [''])[0]) for i in items if len(i.get('title', [''])[0]) > 20]
+    except:
+        pass
     return []
 
-def search_media(query, mode="Name", academic_name=None):
-    """
-    Searches Google News RSS for the query.
-    mode='Name': Strict affiliation check.
-    mode='Pub': Loose check (referencing the paper is enough).
-    """
-    encoded_query = urllib.parse.quote(query)
-    # Search GB (UK) news in English
-    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-GB&gl=GB&ceid=GB:en"
+def search_google_rss(query, mode="Name", academic_name=None):
+    """Fast News Search (RSS)"""
+    encoded = urllib.parse.quote(query)
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
+    hits = []
     
     try:
-        feed = feedparser.parse(rss_url)
-        hits = []
-        
+        feed = feedparser.parse(url)
         for entry in feed.entries:
-            title = entry.title
-            link = entry.link
-            pub_date = normalize_date(entry.published)
-            summary = getattr(entry, 'summary', '')
+            title = clean_html(entry.title)
+            summary = clean_html(getattr(entry, 'summary', ''))
             full_text = f"{title} {summary}"
             
-            is_match = False
-            
+            # Logic: If searching by Name, verify context. If searching by Pub Title, trust the title match.
+            valid = False
             if mode == "Name":
-                # Must have Affiliation in text
-                if verify_affiliation(full_text, academic_name):
-                    is_match = True
-            elif mode == "Pub":
-                # If searching by Title, assume relevant if title matches
-                if len(title) > 10: 
-                    is_match = True
+                if verify_affiliation(full_text, academic_name): valid = True
+            else: # Mode == Pub
+                valid = True 
 
-            if is_match:
+            if valid:
                 hits.append({
                     "LCDS Mention": title,
-                    "Summary": summary,
-                    "Link": link,
-                    "Date Available Online": pub_date,
-                    "Type": "Media Mention" if mode == "Name" else "Pub Reference",
+                    "Link": entry.link,
+                    "Date Available Online": normalize_date(entry.published),
+                    "Type": "Media Mention",
                     "Source": entry.source.get('title', 'Google News'),
                     "Name": academic_name,
-                    "Snippet": full_text[:500]
+                    "Snippet": summary[:300]
                 })
-        
-        return hits
     except Exception as e:
-        logging.error(f"Media search error for {query}: {e}")
-        return []
+        logging.error(f"RSS Error: {e}")
+        
+    return hits
+
+def search_deep_events(name):
+    """
+    DuckDuckGo Search for 'Keynotes', 'Awards', and 'Talks'.
+    This finds static pages (conference agendas, university news) that RSS misses.
+    """
+    hits = []
+    # Query: "Name" + (Keynote OR Award OR Prize) + Demography
+    query = f'"{name}" (keynote OR plenary OR award OR prize) demography'
+    
+    try:
+        # DDGS can be sensitive, so we use it gently
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, region='wt-wt', safesearch='off', timelimit='y', max_results=5))
+            
+            for r in results:
+                title = r.get('title', '')
+                link = r.get('href', '')
+                snippet = r.get('body', '')
+                
+                # Verify it's actually about them
+                if verify_affiliation(title + " " + snippet, name):
+                    hits.append({
+                        "LCDS Mention": title,
+                        "Link": link,
+                        "Date Available Online": datetime.now().strftime('%Y-%m-%d'), # DDG doesn't give precise dates, assume current/recent
+                        "Type": "Talk/Award",
+                        "Source": "Web Search",
+                        "Name": name,
+                        "Snippet": snippet[:300]
+                    })
+                time.sleep(1) # Be polite
+    except Exception as e:
+        logging.warning(f"Deep Search failed for {name}: {e}")
+        
+    return hits
+
+# --- MAIN ---
 
 def main():
-    print("--- Starting LCDS Media Tracker v2.1 (Encoding Fix) ---")
+    print("--- Starting LCDS Event & Media Tracker v3.0 ---")
     
-    # 1. LOAD ACADEMICS (With robust encoding check)
     df_orcid = load_orcid_file(INPUT_ORCID_FILE)
-    
-    # Validate columns
-    if 'Name' not in df_orcid.columns:
-        logging.error(f"Input CSV is missing the 'Name' column. Found: {df_orcid.columns.tolist()}")
-        return
+    if 'Name' not in df_orcid.columns: return
 
-    all_results = []
-    
-    # 2. LOAD EXISTING DATA
+    # Load existing to avoid dupes
     try:
-        df_existing = pd.read_csv(OUTPUT_FILE)
-        existing_links = set(df_existing['Link'].astype(str))
-        print(f"Loaded {len(df_existing)} existing records.")
+        df_old = pd.read_csv(OUTPUT_FILE)
+        existing_links = set(df_old['Link'].astype(str))
+        all_data = df_old.to_dict('records')
     except:
-        df_existing = pd.DataFrame()
         existing_links = set()
-        print("No existing tracker file found. Starting fresh.")
+        all_data = []
 
-    # 3. PROCESSING LOOP
-    total_people = len(df_orcid)
-    
-    for idx, row in df_orcid.iterrows():
+    for _, row in df_orcid.iterrows():
         name = row['Name']
-        # Handle different column names for ORCID (case insensitive)
         orcid_col = next((c for c in df_orcid.columns if c.lower() == 'orcid'), None)
         orcid = row[orcid_col] if orcid_col else None
         
-        print(f"[{idx+1}/{total_people}] Processing: {name}...")
+        print(f"Scanning: {name}...")
+
+        # 1. CROSSREF (HIDDEN SEED)
+        # We fetch titles, but do NOT add them to 'all_data' directly.
+        pub_titles = fetch_crossref_titles(orcid)
         
-        # A. FETCH PUBLICATIONS (CROSSREF)
-        pubs = fetch_crossref_pubs(orcid)
-        for p in pubs:
-            # Add Publication to tracker
-            pub_entry = {
-                "LCDS Mention": p['Title'],
-                "Summary": f"DOI: {p['DOI']}",
-                "Link": f"https://doi.org/{p['DOI']}",
-                "Date Available Online": normalize_date(p['Date']),
-                "Type": "Publication",
-                "Source": "Crossref",
-                "Name": name,
-                "Snippet": f"New publication detected: {p['Title']}"
-            }
-            if pub_entry['Link'] not in existing_links:
-                all_results.append(pub_entry)
-                existing_links.add(pub_entry['Link'])
+        # 2. TRACK PUBLICATIONS IN MEDIA
+        for title in pub_titles:
+            # Search Google News for the paper title
+            news_hits = search_google_rss(f'"{title}"', mode="Pub", academic_name=name)
+            for h in news_hits:
+                if h['Link'] not in existing_links:
+                    h['Type'] = 'Research Coverage' # Specific tag for paper mentions
+                    all_data.append(h)
+                    existing_links.add(h['Link'])
+            time.sleep(0.5)
 
-            # B. SEARCH MEDIA FOR THIS PUBLICATION
-            if len(p['Title']) > 20:
-                media_hits = search_media(f'"{p["Title"]}"', mode="Pub", academic_name=name)
-                for m in media_hits:
-                    if m['Link'] not in existing_links:
-                        all_results.append(m)
-                        existing_links.add(m['Link'])
-                time.sleep(1) 
+        # 3. TRACK PERSON (MEDIA)
+        name_hits = search_google_rss(f'"{name}"', mode="Name", academic_name=name)
+        for h in name_hits:
+            if h['Link'] not in existing_links:
+                all_data.append(h)
+                existing_links.add(h['Link'])
 
-        # C. SEARCH MEDIA FOR ACADEMIC NAME (STRICT AFFILIATION)
-        name_hits = search_media(f'"{name}"', mode="Name", academic_name=name)
-        for m in name_hits:
-            if m['Link'] not in existing_links:
-                all_results.append(m)
-                existing_links.add(m['Link'])
+        # 4. TRACK EVENTS (TALKS/AWARDS - DEEP SEARCH)
+        event_hits = search_deep_events(name)
+        for h in event_hits:
+            if h['Link'] not in existing_links:
+                all_data.append(h)
+                existing_links.add(h['Link'])
         
-        time.sleep(1) # Polite delay
+        time.sleep(2) # Polite delay between people
 
-    # 4. MERGE & SAVE
-    if all_results:
-        df_new = pd.DataFrame(all_results)
-        df_final = pd.concat([df_existing, df_new], ignore_index=True)
-    else:
-        df_final = df_existing
-
-    # 5. FILTER & EXPORT
+    # SAVE
+    df_final = pd.DataFrame(all_data)
     if not df_final.empty:
-        # Date cleaning
+        # Date Filter (Keep ±6 Months)
         df_final['Date Available Online'] = pd.to_datetime(df_final['Date Available Online'], errors='coerce')
+        s_date, e_date = get_date_window()
+        df_final = df_final[
+            (df_final['Date Available Online'] >= s_date) & 
+            (df_final['Date Available Online'] <= e_date)
+        ]
         
-        start_date, end_date = get_date_window()
-        mask = (df_final['Date Available Online'] >= pd.to_datetime(start_date)) & \
-               (df_final['Date Available Online'] <= pd.to_datetime(end_date))
-        
-        df_final_filtered = df_final.loc[mask].copy()
-        df_final_filtered.sort_values(by='Date Available Online', ascending=False, inplace=True)
-        
-        df_final_filtered.to_csv(OUTPUT_FILE, index=False)
-        print(f"Done! Saved {len(df_final_filtered)} records to {OUTPUT_FILE} (Filtered to ±6 months).")
-    else:
-        print("No data to save.")
+        df_final.sort_values('Date Available Online', ascending=False, inplace=True)
+        df_final.to_csv(OUTPUT_FILE, index=False)
+        print(f"Saved {len(df_final)} records.")
 
 if __name__ == "__main__":
     main()

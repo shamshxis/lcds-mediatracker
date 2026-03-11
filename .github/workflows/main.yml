@@ -24,18 +24,17 @@ jobs:
         run: |
           pip install pandas feedparser requests beautifulsoup4 lxml python-dateutil
 
+      # THE FIX IS HERE: Added -u to force live logging
       - name: Run Tracker
-        run: python tracker.py
+        run: python -u tracker.py
 
       - name: Commit and Push (Data + Memory + Archive)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # ⚠️ Ensure all three files are added to the repository
           git add lcds_media_tracker.csv source_memory.json lcds_media_archive.csv
           
-          # Only commit if there are actual changes
           if git diff --staged --quiet; then
             echo "No changes found."
             exit 0

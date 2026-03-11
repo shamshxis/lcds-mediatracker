@@ -20,7 +20,6 @@ jobs:
         with:
           python-version: '3.9'
 
-      # Install dependencies manually (Saves the Tracker)
       - name: Install Tracker Dependencies
         run: |
           pip install pandas feedparser requests beautifulsoup4 lxml python-dateutil
@@ -28,20 +27,20 @@ jobs:
       - name: Run Tracker
         run: python tracker.py
 
-      - name: Commit and Push (Data + Memory)
+      - name: Commit and Push (Data + Memory + Archive)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # ⚠️ ADD BOTH FILES
-          git add lcds_media_tracker.csv source_memory.json
+          # ⚠️ Ensure all three files are added to the repository
+          git add lcds_media_tracker.csv source_memory.json lcds_media_archive.csv
           
-          # Only commit if there are changes
+          # Only commit if there are actual changes
           if git diff --staged --quiet; then
             echo "No changes found."
             exit 0
           fi
           
-          git commit -m "🤖 Update tracker data & memory"
+          git commit -m "🤖 Update tracker data, memory & historical archive"
           git pull --rebase origin main
           git push

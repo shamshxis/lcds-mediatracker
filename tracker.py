@@ -17,7 +17,7 @@ INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 ARCHIVE_FILE = "lcds_media_archive.csv" 
 MEMORY_FILE = "source_memory.json"
-USER_AGENT = "LCDS_Impact_Tracker/12.2 (mailto:lcds.media@demography.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/12.3 (mailto:lcds.media@demography.ox.ac.uk)"
 
 # 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES + LEGACY SOCIALS
 URL_BLOCKLIST = [
@@ -62,12 +62,11 @@ GDELT_QUERIES = [
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- ETHICAL SCRAPING: ROBOTS.TXT MANAGER ---
+# --- ETHICAL SCRAPING: ROBOTS.TXT MANAGER (WITH STRICT TIMEOUT) ---
 class RobotManager:
     def __init__(self, user_agent):
         self.parsers = {}
         self.user_agent = user_agent
-        # Whitelist RSS aggregators so we don't accidentally block valid syndication links
         self.allowed_aggregators = ["news.google.com", "bing.com", "yahoo.com"]
 
     def can_fetch(self, url):
@@ -83,9 +82,13 @@ class RobotManager:
                 rp = urllib.robotparser.RobotFileParser()
                 rp.set_url(f"{domain}/robots.txt")
                 try:
-                    rp.read()
+                    # THE FIX: We use requests with a strict 5-second timeout instead of the default infinite wait
+                    resp = requests.get(f"{domain}/robots.txt", timeout=5, headers={"User-Agent": self.user_agent})
+                    if resp.status_code == 200:
+                        lines = resp.text.splitlines()
+                        rp.parse(lines)
                     self.parsers[domain] = rp
-                except:
+                except Exception as e:
                     self.parsers[domain] = None 
             
             if self.parsers[domain] is None: return True
@@ -195,13 +198,16 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
     engines = {
         "Google News": f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en",
         "Bing News": f"https://www.bing.com/news/search?q={encoded}&format=RSS",
-        "Bing Web Search": f"https://www.bing.com/search?q={encoded}&format=RSS", # Added for local sites
+        "Bing Web Search": f"https://www.bing.com/search?q={encoded}&format=RSS", 
         "Yahoo News": f"https://news.search.yahoo.com/rss?p={encoded}"
     }
     
     for engine_name, url in engines.items():
         try:
-            feed = feedparser.parse(url)
+            # THE FIX: Force a 10-second timeout on the RSS feed request
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            feed = feedparser.parse(r.text)
+            
             for entry in feed.entries:
                 link = entry.link
                 title = clean_html(entry.title)
@@ -237,9 +243,8 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
     return hits
 
 def search_deep_web(name, memory=None):
-    """Scrapes the open web for local sites (like Rotary Clubs) using built-in BeautifulSoup."""
+    """Scrapes the open web for local sites using built-in BeautifulSoup."""
     hits = []
-    # Narrow query to local news, awards, and community sites
     query = f'"{name}" (award OR prize OR keynote OR community)'
     url = "https://html.duckduckgo.com/html/"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -257,7 +262,6 @@ def search_deep_web(name, memory=None):
                 title = clean_html(title_tag.text)
                 snippet = clean_html(a_tag.text)
                 
-                # Clean up redirect URLs
                 if "//duckduckgo.com/l/?uddg=" in link:
                     try:
                         link = urllib.parse.unquote(link.split("uddg=")[1].split("&")[0])
@@ -279,7 +283,7 @@ def search_deep_web(name, memory=None):
                         "Name": name,
                         "Snippet": snippet[:400]
                     })
-        time.sleep(1) # Ethical delay
+        time.sleep(1) 
     except: pass
     return hits
 
@@ -287,7 +291,10 @@ def fetch_targeted_radar(academic_name):
     hits = []
     for feed_info in TARGETED_FEEDS:
         try:
-            feed = feedparser.parse(feed_info["url"])
+            # THE FIX: Force a 10-second timeout
+            r = requests.get(feed_info["url"], headers={"User-Agent": USER_AGENT}, timeout=10)
+            feed = feedparser.parse(r.text)
+            
             for entry in feed.entries:
                 title = clean_html(entry.title)
                 summary = clean_html(getattr(entry, 'summary', ''))
@@ -349,7 +356,7 @@ def fetch_gdelt_impact(memory=None):
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v12.2 (Deep Web & Aggregator Bypass) ---")
+    print("--- LCDS Tracker v12.3 (Timeout Protection) ---")
     
     memory = load_memory()
     print(f"Memory: Tracking {len(memory['trusted_sources'])} trusted sources.")
@@ -368,7 +375,6 @@ def main():
         existing_links = set()
         all_data = []
 
-    # 1. PROCESS PEOPLE
     for _, row in df_orcid.iterrows():
         name = row['Name']
         orcid_col = next((c for c in df_orcid.columns if c.lower() == 'orcid'), None)
@@ -411,7 +417,6 @@ def main():
                 all_data.append(h)
                 existing_links.add(h['Link'])
                 
-        # 🚨 THE DEEP WEB LAYER: Specifically hunts for local sites and community awards
         deep_hits = search_deep_web(name, memory)
         for h in deep_hits:
              if h['Link'] not in existing_links:
@@ -420,14 +425,12 @@ def main():
 
         time.sleep(1)
 
-    # 2. PROCESS GDELT
     gdelt_hits = fetch_gdelt_impact(memory=memory)
     for h in gdelt_hits:
         if h['Link'] not in existing_links:
             all_data.append(h)
             existing_links.add(h['Link'])
 
-    # 3. BUILD DATAFRAMES
     df_new_data = pd.DataFrame(all_data)
     
     if not df_new_data.empty:

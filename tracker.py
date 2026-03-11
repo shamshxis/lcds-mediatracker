@@ -17,7 +17,7 @@ INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 ARCHIVE_FILE = "lcds_media_archive.csv" 
 MEMORY_FILE = "source_memory.json"
-USER_AGENT = "LCDS_Impact_Tracker/12.0 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/12.1 (mailto:admin@lcds.ox.ac.uk)"
 
 # 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES + LEGACY SOCIALS
 URL_BLOCKLIST = [
@@ -46,7 +46,6 @@ TRUSTED_MEDIA = [
 
 # 3. TARGETED RADAR: Global Conferences, Societies & Substacks
 TARGETED_FEEDS = [
-    # Global Societies
     {"name": "PAA (US)", "url": 'https://news.google.com/rss/search?q="Population+Association+of+America"+OR+"PAA+Annual+Meeting"&hl=en-US&gl=US&ceid=US:en', "type": "Conference"},
     {"name": "IUSSP (Global)", "url": 'https://news.google.com/rss/search?q="International+Union+for+the+Scientific+Study+of+Population"+OR+"IUSSP"&hl=en-GB&gl=GB&ceid=GB:en', "type": "Conference"},
     {"name": "EAPS / EPC (Europe)", "url": 'https://news.google.com/rss/search?q="European+Association+for+Population+Studies"+OR+"European+Population+Conference"&hl=en-GB&gl=GB&ceid=GB:en', "type": "Conference"},
@@ -54,9 +53,6 @@ TARGETED_FEEDS = [
     {"name": "APA (Australia)", "url": 'https://news.google.com/rss/search?q="Australian+Population+Association"&hl=en-AU&gl=AU&ceid=AU:en', "type": "Conference"},
     {"name": "Asian Population Assoc", "url": 'https://news.google.com/rss/search?q="Asian+Population+Association"&hl=en-IN&gl=IN&ceid=IN:en', "type": "Conference"},
     {"name": "IASP (India)", "url": 'https://news.google.com/rss/search?q="Indian+Association+for+the+Study+of+Population"+OR+"IASP+Conference"&hl=en-IN&gl=IN&ceid=IN:en', "type": "Conference"},
-    
-    # Example: If you know a specific Substack, add it here like this:
-    # {"name": "Works in Progress", "url": "https://worksinprogress.substack.com/feed", "type": "Blog/Opinion"},
 ]
 
 GDELT_QUERIES = [
@@ -74,12 +70,19 @@ class RobotManager:
     def __init__(self, user_agent):
         self.parsers = {}
         self.user_agent = user_agent
+        # THE FIX: We explicitly allow RSS aggregators because their links are public syndication redirects
+        self.allowed_aggregators = ["news.google.com", "bing.com", "yahoo.com"]
 
     def can_fetch(self, url):
         try:
             parsed_url = urllib.parse.urlparse(url)
-            domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            netloc = parsed_url.netloc.lower()
             
+            # Bypass robots.txt check for known RSS aggregator redirects
+            if any(agg in netloc for agg in self.allowed_aggregators):
+                return True
+
+            domain = f"{parsed_url.scheme}://{netloc}"
             if domain not in self.parsers:
                 rp = urllib.robotparser.RobotFileParser()
                 rp.set_url(f"{domain}/robots.txt")
@@ -181,7 +184,6 @@ def fetch_crossref_titles(orcid):
     return []
 
 def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type="Media Mention", memory=None):
-    """Searches Google, Bing, and Yahoo via RSS."""
     encoded = urllib.parse.quote(query)
     hits = []
     engines = {
@@ -229,7 +231,6 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
     return hits
 
 def fetch_targeted_radar(academic_name):
-    """Parses defined RSS feeds for societies and conferences."""
     hits = []
     for feed_info in TARGETED_FEEDS:
         try:
@@ -295,7 +296,7 @@ def fetch_gdelt_impact(memory=None):
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v12.0 (Substack/Modern Newsletters included) ---")
+    print("--- LCDS Tracker v12.1 (Aggregator Whitelist) ---")
     
     memory = load_memory()
     print(f"Memory: Tracking {len(memory['trusted_sources'])} trusted sources.")
@@ -305,7 +306,6 @@ def main():
         print("Error: Name column missing in ORCID file.")
         return
 
-    # Load Existing Active File
     try:
         df_old = pd.read_csv(OUTPUT_FILE)
         df_old = df_old[df_old['Type'] != 'Publication']
@@ -323,14 +323,12 @@ def main():
         
         print(f"Scanning: {name}")
 
-        # A. Targeted Radar (Societies/Conferences/Direct Substacks)
         radar_hits = fetch_targeted_radar(name)
         for h in radar_hits:
             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
 
-        # B. Crossref Seed -> Multi-Engine News
         titles = fetch_crossref_titles(orcid)
         for t in titles:
             hits = search_multi_engine_rss(f'"{t}"', mode="Pub", academic_name=name, default_type="Research Coverage", memory=memory)
@@ -340,14 +338,12 @@ def main():
                     existing_links.add(h['Link'])
             time.sleep(0.5)
 
-        # C. Direct Name Search (Multi-Engine Media)
         hits = search_multi_engine_rss(f'"{name}"', mode="Name", academic_name=name, default_type="Media Mention", memory=memory)
         for h in hits:
             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
         
-        # D. Event Search (Keynotes & Awards)
         event_query = f'"{name}" AND (keynote OR plenary OR award OR prize)'
         event_hits = search_multi_engine_rss(event_query, mode="Name", academic_name=name, default_type="Talk/Award", memory=memory)
         for h in event_hits:
@@ -355,8 +351,6 @@ def main():
                 all_data.append(h)
                 existing_links.add(h['Link'])
 
-        # E. MODERN NEWSLETTERS & BLOGS (Substack, Medium, Ghost)
-        # We enforce "site:" operators to guarantee it only looks in these platforms.
         blog_query = f'"{name}" (site:substack.com OR site:medium.com OR site:ghost.io)'
         blog_hits = search_multi_engine_rss(blog_query, mode="Name", academic_name=name, default_type="Blog/Opinion", memory=memory)
         for h in blog_hits:
@@ -366,7 +360,7 @@ def main():
 
         time.sleep(1)
 
-    # 2. PROCESS GDELT (GLOBAL MEDIA)
+    # 2. PROCESS GDELT
     gdelt_hits = fetch_gdelt_impact(memory=memory)
     for h in gdelt_hits:
         if h['Link'] not in existing_links:
@@ -379,7 +373,6 @@ def main():
     if not df_new_data.empty:
         df_new_data['Date Available Online'] = pd.to_datetime(df_new_data['Date Available Online'], errors='coerce')
         
-        # --- A. MASTER ARCHIVE SAVE (Never Delete Old Data) ---
         try:
             df_archive = pd.read_csv(ARCHIVE_FILE)
             df_archive['Date Available Online'] = pd.to_datetime(df_archive['Date Available Online'], errors='coerce')
@@ -393,7 +386,6 @@ def main():
             df_master.to_csv(ARCHIVE_FILE, index=False)
             print(f"Archived {len(df_master)} total historical records to {ARCHIVE_FILE}.")
 
-        # --- B. DASHBOARD VIEW SAVE (Filtered to ±6 Months) ---
         s_date, e_date = get_date_window()
         mask = ((df_new_data['Date Available Online'] >= s_date) & (df_new_data['Date Available Online'] <= e_date)) | (df_new_data['Date Available Online'].isna())
         df_dashboard_view = df_new_data[mask].copy()

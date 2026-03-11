@@ -4,5 +4,5 @@ requests
 beautifulsoup4
 python-dateutil
 plotly
-streamlit
-altair
+streamlit>=1.30.0
+altair<5.0.0

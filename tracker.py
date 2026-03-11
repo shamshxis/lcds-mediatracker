@@ -17,7 +17,7 @@ INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 ARCHIVE_FILE = "lcds_media_archive.csv" 
 MEMORY_FILE = "source_memory.json"
-USER_AGENT = "LCDS_Impact_Tracker/12.1 (mailto:admin@lcds.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/12.2 (mailto:lcds.media@demography.ox.ac.uk)"
 
 # 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES + LEGACY SOCIALS
 URL_BLOCKLIST = [
@@ -44,15 +44,12 @@ TRUSTED_MEDIA = [
     "newscientist.com", "phys.org", "eurekalert.org"
 ]
 
-# 3. TARGETED RADAR: Global Conferences, Societies & Substacks
+# 3. TARGETED RADAR: Global Conferences
 TARGETED_FEEDS = [
     {"name": "PAA (US)", "url": 'https://news.google.com/rss/search?q="Population+Association+of+America"+OR+"PAA+Annual+Meeting"&hl=en-US&gl=US&ceid=US:en', "type": "Conference"},
     {"name": "IUSSP (Global)", "url": 'https://news.google.com/rss/search?q="International+Union+for+the+Scientific+Study+of+Population"+OR+"IUSSP"&hl=en-GB&gl=GB&ceid=GB:en', "type": "Conference"},
     {"name": "EAPS / EPC (Europe)", "url": 'https://news.google.com/rss/search?q="European+Association+for+Population+Studies"+OR+"European+Population+Conference"&hl=en-GB&gl=GB&ceid=GB:en', "type": "Conference"},
     {"name": "BSPS (UK)", "url": 'https://news.google.com/rss/search?q="British+Society+for+Population+Studies"+OR+"BSPS"&hl=en-GB&gl=GB&ceid=GB:en', "type": "Conference"},
-    {"name": "APA (Australia)", "url": 'https://news.google.com/rss/search?q="Australian+Population+Association"&hl=en-AU&gl=AU&ceid=AU:en', "type": "Conference"},
-    {"name": "Asian Population Assoc", "url": 'https://news.google.com/rss/search?q="Asian+Population+Association"&hl=en-IN&gl=IN&ceid=IN:en', "type": "Conference"},
-    {"name": "IASP (India)", "url": 'https://news.google.com/rss/search?q="Indian+Association+for+the+Study+of+Population"+OR+"IASP+Conference"&hl=en-IN&gl=IN&ceid=IN:en', "type": "Conference"},
 ]
 
 GDELT_QUERIES = [
@@ -70,7 +67,7 @@ class RobotManager:
     def __init__(self, user_agent):
         self.parsers = {}
         self.user_agent = user_agent
-        # THE FIX: We explicitly allow RSS aggregators because their links are public syndication redirects
+        # Whitelist RSS aggregators so we don't accidentally block valid syndication links
         self.allowed_aggregators = ["news.google.com", "bing.com", "yahoo.com"]
 
     def can_fetch(self, url):
@@ -78,7 +75,6 @@ class RobotManager:
             parsed_url = urllib.parse.urlparse(url)
             netloc = parsed_url.netloc.lower()
             
-            # Bypass robots.txt check for known RSS aggregator redirects
             if any(agg in netloc for agg in self.allowed_aggregators):
                 return True
 
@@ -150,7 +146,7 @@ def classify_entry(title, snippet, default_type):
     if "radio" in full_text or "bbc radio" in full_text or " fm " in full_text: return "Radio"
     if "blog" in full_text or "substack" in full_text or "opinion" in full_text or "medium.com" in full_text: return "Blog/Opinion"
     if "keynote" in full_text or "plenary" in full_text: return "Keynote"
-    if "award" in full_text or "prize" in full_text or "medal" in full_text: return "Award"
+    if "award" in full_text or "prize" in full_text or "medal" in full_text or "rotary" in full_text: return "Award"
     if "conference" in full_text or "annual meeting" in full_text: return "Conference"
     if "forum" in full_text or "discussion" in full_text: return "Forum/Discussion"
     return default_type
@@ -168,6 +164,16 @@ def load_orcid_file(filepath):
         try: return pd.read_csv(filepath, encoding=enc)
         except: continue
     return pd.DataFrame() 
+
+def extract_date_from_text(text):
+    if not text: return None
+    match = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(\d{4}-\d{2}-\d{2})', text)
+    if match:
+        try:
+            dt = date_parser.parse(match.group(0))
+            return dt.strftime('%Y-%m-%d')
+        except: pass
+    return None
 
 # --- DATA FETCHERS ---
 
@@ -189,6 +195,7 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
     engines = {
         "Google News": f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en",
         "Bing News": f"https://www.bing.com/news/search?q={encoded}&format=RSS",
+        "Bing Web Search": f"https://www.bing.com/search?q={encoded}&format=RSS", # Added for local sites
         "Yahoo News": f"https://news.search.yahoo.com/rss?p={encoded}"
     }
     
@@ -202,7 +209,6 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
                 if is_blocked_content(link, title, academic_name): continue
                     
                 if not robot_checker.can_fetch(link):
-                    logging.info(f"Skipping link (Robots.txt restricted): {link}")
                     continue
                 
                 summary = clean_html(getattr(entry, 'summary', ''))
@@ -228,6 +234,53 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
                         "Snippet": summary[:400]
                     })
         except: pass
+    return hits
+
+def search_deep_web(name, memory=None):
+    """Scrapes the open web for local sites (like Rotary Clubs) using built-in BeautifulSoup."""
+    hits = []
+    # Narrow query to local news, awards, and community sites
+    query = f'"{name}" (award OR prize OR keynote OR community)'
+    url = "https://html.duckduckgo.com/html/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    try:
+        response = requests.post(url, data={'q': query}, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        for result in soup.find_all('div', class_='result'):
+            a_tag = result.find('a', class_='result__snippet') 
+            title_tag = result.find('h2', class_='result__title')
+            
+            if a_tag and title_tag:
+                link = a_tag.get('href', '')
+                title = clean_html(title_tag.text)
+                snippet = clean_html(a_tag.text)
+                
+                # Clean up redirect URLs
+                if "//duckduckgo.com/l/?uddg=" in link:
+                    try:
+                        link = urllib.parse.unquote(link.split("uddg=")[1].split("&")[0])
+                    except: pass
+
+                if is_blocked_content(link, title, name): continue
+                if not robot_checker.can_fetch(link): continue
+                
+                if verify_affiliation(title + " " + snippet, name):
+                    domain = urllib.parse.urlparse(link).netloc
+                    if memory is not None: update_memory(domain, memory)
+                    
+                    hits.append({
+                        "LCDS Mention": title,
+                        "Link": link,
+                        "Date Available Online": extract_date_from_text(snippet),
+                        "Type": classify_entry(title, snippet, "Local/Web Mention"),
+                        "Source": "Deep Web Crawler",
+                        "Name": name,
+                        "Snippet": snippet[:400]
+                    })
+        time.sleep(1) # Ethical delay
+    except: pass
     return hits
 
 def fetch_targeted_radar(academic_name):
@@ -296,7 +349,7 @@ def fetch_gdelt_impact(memory=None):
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v12.1 (Aggregator Whitelist) ---")
+    print("--- LCDS Tracker v12.2 (Deep Web & Aggregator Bypass) ---")
     
     memory = load_memory()
     print(f"Memory: Tracking {len(memory['trusted_sources'])} trusted sources.")
@@ -354,6 +407,13 @@ def main():
         blog_query = f'"{name}" (site:substack.com OR site:medium.com OR site:ghost.io)'
         blog_hits = search_multi_engine_rss(blog_query, mode="Name", academic_name=name, default_type="Blog/Opinion", memory=memory)
         for h in blog_hits:
+             if h['Link'] not in existing_links:
+                all_data.append(h)
+                existing_links.add(h['Link'])
+                
+        # 🚨 THE DEEP WEB LAYER: Specifically hunts for local sites and community awards
+        deep_hits = search_deep_web(name, memory)
+        for h in deep_hits:
              if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])

@@ -17,21 +17,22 @@ INPUT_ORCID_FILE = "lcds_people_orcid_updated.csv"
 OUTPUT_FILE = "lcds_media_tracker.csv"
 ARCHIVE_FILE = "lcds_media_archive.csv" 
 MEMORY_FILE = "source_memory.json"
-USER_AGENT = "LCDS_Impact_Tracker/12.3 (mailto:lcds.media@demography.ox.ac.uk)"
+USER_AGENT = "LCDS_Impact_Tracker/12.5 (mailto:admin@lcds.ox.ac.uk)"
 
-# 1. BLOCKLIST: ACADEMIC JOURNALS + STATIC PROFILES + LEGACY SOCIALS
+# 1. BLOCKLIST: ACADEMIC JOURNALS + DIRECTORIES + STATIC PROFILES
 URL_BLOCKLIST = [
     "nature.com", "science.org", "sciencedirect.com", "wiley.com", 
     "springer.com", "tandfonline.com", "sagepub.com", "frontiersin.org",
     "plos.org", "mdpi.com", "academic.oup.com", "cambridge.org", 
     "jstor.org", "ncbi.nlm.nih.gov", "researchgate.net", "academia.edu",
     "/people/", "/staff/", "/profile/", "/biography/", "/cv", "/contact",
-    "linkedin.com", "facebook.com", "twitter.com", "instagram.com"
+    "linkedin.com", "facebook.com", "twitter.com", "instagram.com", "wikipedia.org"
 ]
 
 TITLE_BLOCKLIST = [
     "profile", "biography", "curriculum vitae", "cv", "staff", "people", 
-    "contact", "about us", "faculty", "home page", "department of"
+    "contact", "about us", "faculty", "home page", "department of",
+    "alumni", "directory", "wikipedia", "open library", "course catalog"
 ]
 
 # 2. ALLOWLIST (Preferred Media)
@@ -62,7 +63,7 @@ GDELT_QUERIES = [
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- ETHICAL SCRAPING: ROBOTS.TXT MANAGER (WITH STRICT TIMEOUT) ---
+# --- ETHICAL SCRAPING: ROBOTS.TXT MANAGER ---
 class RobotManager:
     def __init__(self, user_agent):
         self.parsers = {}
@@ -82,7 +83,6 @@ class RobotManager:
                 rp = urllib.robotparser.RobotFileParser()
                 rp.set_url(f"{domain}/robots.txt")
                 try:
-                    # THE FIX: We use requests with a strict 5-second timeout instead of the default infinite wait
                     resp = requests.get(f"{domain}/robots.txt", timeout=5, headers={"User-Agent": self.user_agent})
                     if resp.status_code == 200:
                         lines = resp.text.splitlines()
@@ -93,7 +93,8 @@ class RobotManager:
             
             if self.parsers[domain] is None: return True
             return self.parsers[domain].can_fetch(self.user_agent, url)
-        except: return True 
+        except Exception: 
+            return True
 
 robot_checker = RobotManager(USER_AGENT)
 
@@ -156,7 +157,12 @@ def classify_entry(title, snippet, default_type):
 
 def verify_affiliation(text, name=""):
     text_lower = text.lower()
-    affiliations = ["oxford", "leverhulme", "lcds", "nuffield", "demographic", "population", "sociology"]
+    
+    # "population" dropped to prevent generic town/city overlaps.
+    affiliations = [
+        "oxford", "leverhulme", "lcds", "nuffield", "demographic", "sociology", 
+        "population research", "population studies", "population health"
+    ]
     if name and name.lower() not in text_lower: return False
     has_aff = any(a in text_lower for a in affiliations)
     if name and "melinda mills" in name.lower() and "groningen" in text_lower: has_aff = True
@@ -204,7 +210,6 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
     
     for engine_name, url in engines.items():
         try:
-            # THE FIX: Force a 10-second timeout on the RSS feed request
             r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
             feed = feedparser.parse(r.text)
             
@@ -213,9 +218,7 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
                 title = clean_html(entry.title)
                 
                 if is_blocked_content(link, title, academic_name): continue
-                    
-                if not robot_checker.can_fetch(link):
-                    continue
+                if not robot_checker.can_fetch(link): continue
                 
                 summary = clean_html(getattr(entry, 'summary', ''))
                 full_text = f"{title} {summary}"
@@ -242,10 +245,11 @@ def search_multi_engine_rss(query, mode="Name", academic_name=None, default_type
         except: pass
     return hits
 
-def search_deep_web(name, memory=None):
-    """Scrapes the open web for local sites using built-in BeautifulSoup."""
+def search_deep_web(name, affil_query, memory=None):
+    """Scrapes the open web for local sites using built-in BeautifulSoup + Strict Affiliation."""
     hits = []
-    query = f'"{name}" (award OR prize OR keynote OR community)'
+    # Deep Web must have name + event + explicit academic affiliation
+    query = f'"{name}" (award OR prize OR keynote OR community) {affil_query}'
     url = "https://html.duckduckgo.com/html/"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
@@ -291,7 +295,6 @@ def fetch_targeted_radar(academic_name):
     hits = []
     for feed_info in TARGETED_FEEDS:
         try:
-            # THE FIX: Force a 10-second timeout
             r = requests.get(feed_info["url"], headers={"User-Agent": USER_AGENT}, timeout=10)
             feed = feedparser.parse(r.text)
             
@@ -356,7 +359,7 @@ def fetch_gdelt_impact(memory=None):
 # --- MAIN ---
 
 def main():
-    print("--- LCDS Tracker v12.3 (Timeout Protection) ---")
+    print("--- LCDS Tracker v12.5 (Strict Identity Constraints) ---")
     
     memory = load_memory()
     print(f"Memory: Tracking {len(memory['trusted_sources'])} trusted sources.")
@@ -382,6 +385,9 @@ def main():
         
         print(f"Scanning: {name}")
 
+        # ENGINE CONSTRAINT: Force the search engine to only return pages with these academic terms
+        affil_query = '("Oxford" OR "Leverhulme" OR "LCDS" OR "Nuffield" OR "Demographic" OR "Sociology")'
+
         radar_hits = fetch_targeted_radar(name)
         for h in radar_hits:
             if h['Link'] not in existing_links:
@@ -397,27 +403,28 @@ def main():
                     existing_links.add(h['Link'])
             time.sleep(0.5)
 
-        hits = search_multi_engine_rss(f'"{name}"', mode="Name", academic_name=name, default_type="Media Mention", memory=memory)
+        # STRICT SEARCHES
+        hits = search_multi_engine_rss(f'"{name}" {affil_query}', mode="Name", academic_name=name, default_type="Media Mention", memory=memory)
         for h in hits:
             if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
         
-        event_query = f'"{name}" AND (keynote OR plenary OR award OR prize)'
+        event_query = f'"{name}" (keynote OR plenary OR award OR prize) {affil_query}'
         event_hits = search_multi_engine_rss(event_query, mode="Name", academic_name=name, default_type="Talk/Award", memory=memory)
         for h in event_hits:
              if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
 
-        blog_query = f'"{name}" (site:substack.com OR site:medium.com OR site:ghost.io)'
+        blog_query = f'"{name}" {affil_query} (site:substack.com OR site:medium.com OR site:ghost.io)'
         blog_hits = search_multi_engine_rss(blog_query, mode="Name", academic_name=name, default_type="Blog/Opinion", memory=memory)
         for h in blog_hits:
              if h['Link'] not in existing_links:
                 all_data.append(h)
                 existing_links.add(h['Link'])
                 
-        deep_hits = search_deep_web(name, memory)
+        deep_hits = search_deep_web(name, affil_query, memory)
         for h in deep_hits:
              if h['Link'] not in existing_links:
                 all_data.append(h)
